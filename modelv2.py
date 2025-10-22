@@ -11,7 +11,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 保留原模型的FeatureExtractor（未修改）
 class FeatureExtractor(nn.Module):
-    """ResNet50第一层特征提取器（修复inplace激活问题）"""
+    """ResNet50第一层特征提取器（可选冻结，修复inplace激活问题）"""
     def __init__(self, freeze=True):
         super().__init__()
         resnet50 = models.resnet50(pretrained=True)
@@ -231,29 +231,26 @@ class CLIPFocusClassifier(nn.Module):
         image = Image.fromarray(tensor.permute(1, 2, 0).numpy())
         return image
 class CLIPPixelFusion(nn.Module):
-    """基于 CLIP 的像素级焦点融合模型（适配原模型输出）"""
+    """基于 CLIP 的像素级焦点融合模型（输出软焦点图）"""
     def __init__(self, device='cuda', patch_size=32, stride=16):
         super(CLIPPixelFusion, self).__init__()
         self.clip_model = CLIPFocusClassifier(device=device)
         self.device = device
         self.patch_size = patch_size
         self.stride = stride
-        
+
     def forward(self, img1, img2):
-        """基于像素级 CLIP 焦点检测融合两张图像"""
+        """生成与输入尺寸匹配的软焦点图，用于后续可微融合"""
         batch_size = img1.shape[0]
-        fused_images = []
-        focus_maps_list = []  # 只保留焦点图，与原模型输出一致
-        
+        focus_maps_list = []
+
         for b in range(batch_size):
-            # 对每张输入图计算焦点图
             focus_map1 = self.clip_model.get_pixel_focus_map(img1[b], self.patch_size, self.stride)
             focus_map2 = self.clip_model.get_pixel_focus_map(img2[b], self.patch_size, self.stride)
-            
+
             focus_map1_tensor = focus_map1.unsqueeze(0).unsqueeze(0).float().to(self.device)
             focus_map2_tensor = focus_map2.unsqueeze(0).unsqueeze(0).float().to(self.device)
-            
-            # 焦点图插值到原图大小
+
             focus_map1_tensor = F.interpolate(
                 focus_map1_tensor,
                 size=(img1.shape[2], img1.shape[3]),
@@ -266,48 +263,45 @@ class CLIPPixelFusion(nn.Module):
                 mode='bilinear',
                 align_corners=False
             )
-            
-            focus_maps = torch.cat([focus_map1_tensor, focus_map2_tensor], dim=1)  # [1, 2, H, W]
-            
-            # 决策：每个像素选择更清晰的来源（焦点值更高的图）
-            decision_map = torch.argmax(focus_maps, dim=1, keepdim=True)  # [1, 1, H, W]
-            
-            decision_onehot = torch.zeros_like(focus_maps)
-            decision_onehot.scatter_(1, decision_map, 1)
-            
-            # 融合：按决策图拼接两张图的清晰区域
-            fused_img = (img1[b:b+1] * decision_onehot[:, 0:1] + 
-                        img2[b:b+1] * decision_onehot[:, 1:2])
-            
-            fused_images.append(fused_img)
+
+            focus_maps = torch.cat([focus_map1_tensor, focus_map2_tensor], dim=1)
+            focus_maps = torch.clamp(focus_maps, min=1e-6)
+            focus_maps = focus_maps / (focus_maps.sum(dim=1, keepdim=True) + 1e-6)
+
             focus_maps_list.append(focus_maps)
-        
-        fused_img = torch.cat(fused_images, dim=0)
+
         focus_maps = torch.cat(focus_maps_list, dim=0)
-        
-        return fused_img, focus_maps  # 输出格式与原模型保持一致
+
+        return focus_maps
 
 
 # 修改原模型的MultiFocusFusionModel，替换CLIP部分
 class MultiFocusFusionModel(nn.Module):
-    """多聚焦图像融合模型（使用新CLIP模型）"""
-    def __init__(self, block_size=32, overlap=4, clip_patch_size=32, clip_stride=16):
+    """多聚焦图像融合模型（使用可微软聚焦融合）"""
+    def __init__(
+        self,
+        block_size=32,
+        overlap=4,
+        clip_patch_size=32,
+        clip_stride=16,
+        clip_weight=0.6,
+        train_backbone=False,
+    ):
         super().__init__()
-        self.block_size = block_size  # 保留原参数（兼容其他模块）
-        self.overlap = overlap        
-        # 核心模块：保留原特征提取部分
-        self.feature_extractor = FeatureExtractor()
+        self.block_size = block_size
+        self.overlap = overlap
+        self.clip_weight = clip_weight
+
+        self.feature_extractor = FeatureExtractor(freeze=not train_backbone)
         self.focus_head = GradientVarianceFocusHead()
         self.qkcu = QKCU()
-        
-        # 替换原CLIPBlockClassifier为新的CLIP融合模块
+
         self.clip_fusion = CLIPPixelFusion(
             device=device,
             patch_size=clip_patch_size,
             stride=clip_stride
         )
-        
-        # 保留原图像预处理
+
         self.preprocess = transforms.Compose([
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
@@ -332,24 +326,31 @@ class MultiFocusFusionModel(nn.Module):
         feat2 = self.feature_extractor(img2)
         feat2_focus, mask2 = self.focus_head(feat2)  # mask2: (B, 1, H/4, W/4)
         
-        # 2. 使用新CLIP模型进行融合（替换原分块分类逻辑）
-        fused_img, clip_focus_maps = self.clip_fusion(img1, img2)
-        
+        # 2. 使用CLIP生成软焦点图
+        clip_focus_maps = self.clip_fusion(img1, img2)
+
         # 3. 保留原聚焦掩码优化逻辑（融合CLIP结果与低级特征）
         mask1_up = F.interpolate(mask1, size=(H, W), mode='bilinear')
         mask2_up = F.interpolate(mask2, size=(H, W), mode='bilinear')
-        
-        # 融合CLIP焦点图和低级特征焦点图（保持原权重比例7:3）
-        final_focus_maps = torch.cat([
-            0.7 * clip_focus_maps[:, 0:1] + 0.3 * mask1_up,
-            0.7 * clip_focus_maps[:, 1:2] + 0.3 * mask2_up
-        ], dim=1)
-        
-        # 确保权重和为1
-        focus_sum = final_focus_maps.sum(dim=1, keepdim=True) + 1e-8
-        final_focus_maps = final_focus_maps / focus_sum
-        
-        return fused_img, final_focus_maps  # 输出格式与原模型完全一致
+
+        base_focus = torch.cat([mask1_up, mask2_up], dim=1)
+        clip_focus = clip_focus_maps
+
+        base_focus = torch.clamp(base_focus, min=1e-6)
+        base_focus = base_focus / (base_focus.sum(dim=1, keepdim=True) + 1e-6)
+
+        combined_focus = (
+            self.clip_weight * clip_focus + (1.0 - self.clip_weight) * base_focus
+        )
+        combined_focus = torch.clamp(combined_focus, min=1e-6)
+        final_focus_maps = combined_focus / (combined_focus.sum(dim=1, keepdim=True) + 1e-6)
+
+        fused_img = (
+            final_focus_maps[:, 0:1] * img1 +
+            final_focus_maps[:, 1:2] * img2
+        )
+
+        return fused_img, final_focus_maps
 
 
 # 测试代码（验证输出格式兼容性）
@@ -375,3 +376,4 @@ if __name__ == "__main__":
     print(f"融合图像尺寸: {fused_img.shape}")  # 应与输入一致 (2,3,512,512)
     print(f"聚焦掩码尺寸: {focus_maps.shape}")  # 应与原模型一致 (2,2,512,512)
     
+

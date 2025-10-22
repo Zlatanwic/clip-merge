@@ -20,53 +20,54 @@ print(f"使用设备: {device}")
 
 
 # -------------------------- 损失函数（保持原有） --------------------------
-def _torch_fspecial_gauss(size, sigma, device):
-    """生成高斯核，模拟MATLAB的fspecial函数"""
-    x_data, y_data = np.mgrid[-size // 2 + 1:size // 2 + 1, -size // 2 + 1:size // 2 + 1]
-    x = torch.tensor(x_data, dtype=torch.float32, device=device)
-    y = torch.tensor(y_data, dtype=torch.float32, device=device)
-    g = torch.exp(-((x ** 2 + y ** 2) / (2.0 * sigma ** 2)))
-    return g / torch.sum(g)
+def _torch_fspecial_gauss(size, sigma, device, dtype):
+    x, y = np.mgrid[-size // 2 + 1:size // 2 + 1, -size // 2 + 1:size // 2 + 1]
+    x = torch.tensor(x, dtype=dtype, device=device)
+    y = torch.tensor(y, dtype=dtype, device=device)
+    g = torch.exp(-((x**2 + y**2) / (2.0 * sigma**2)))
+    return g / g.sum()
 
 def SSIM_LOSS(img1, img2, size=11, sigma=1.5):
-    """结构相似结构相似性损失函数：1 - SSIM"""
-    device = img1.device
-    window = _torch_fspecial_gauss(size, sigma, device)
+    device, dtype = img1.device, img1.dtype
+    window = _torch_fspecial_gauss(size, sigma, device, dtype)
     window = window.view(1, 1, size, size).repeat(img1.size(1), 1, 1, 1)
-    
-    K1 = 0.01
-    K2 = 0.03
-    L = 1  # 图像已归一化到[0,1]
-    C1 = (K1 * L) ** 2
-    C2 = (K2 * L) ** 2
-    
-    # 计算局部均值
-    mu1 = F.conv2d(img1, window, stride=1, padding=size//2, groups=img1.size(1))
-    mu2 = F.conv2d(img2, window, stride=1, padding=size//2, groups=img2.size(1))
-    
-    mu1_sq = mu1 ** 2
-    mu2_sq = mu2 ** 2
-    mu1_mu2 = mu1 * mu2
-    
-    # 计算方差和协方差
-    sigma1_sq = F.conv2d(img1 * img1, window, stride=1, padding=size//2, groups=img1.size(1)) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, stride=1, padding=size//2, groups=img2.size(1)) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, stride=1, padding=size//2, groups=img1.size(1)) - mu1_mu2
-    
-    # 计算SSIM并返回损失
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return 1 - torch.mean(ssim_map)
 
-def L2_LOSS(batchimg):
-    """L2损失（平方损失）"""
-    l2_norm = torch.norm(batchimg, p=2, dim=[1, 2]) / (batchimg.shape[1] * batchimg.shape[2])
-    return torch.mean(l2_norm)
+    K1, K2, L = 0.01, 0.03, 1.0
+    C1, C2 = (K1 * L) ** 2, (K2 * L) ** 2
 
-def Fro_LOSS(batchimg):
+    # 👇 手动做反射填充
+    pad = size // 2
+    img1_pad = F.pad(img1, (pad, pad, pad, pad), mode='reflect')
+    img2_pad = F.pad(img2, (pad, pad, pad, pad), mode='reflect')
+
+    # 然后正常卷积
+    mu1 = F.conv2d(img1_pad, window, stride=1, groups=img1.size(1))
+    mu2 = F.conv2d(img2_pad, window, stride=1, groups=img2.size(1))
+    mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1_pad * img1_pad, window, stride=1, groups=img1.size(1)) - mu1_sq
+    sigma2_sq = F.conv2d(img2_pad * img2_pad, window, stride=1, groups=img2.size(1)) - mu2_sq
+    sigma12   = F.conv2d(img1_pad * img2_pad, window, stride=1, groups=img1.size(1)) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return 1 - ssim_map.mean()
+
+
+
+def L2_LOSS(diff):
+    """L2损失（更标准版）"""
+    B, C, H, W = diff.shape
+    l2 = torch.norm(diff, p=2, dim=(1, 2, 3)) / (C * H * W)
+    return l2.mean()
+
+def Fro_LOSS(diff):
     """Frobenius损失（矩阵L2范数平方）"""
-    fro_norm = torch.square(torch.norm(batchimg, p='fro', dim=[1, 2])) 
-    fro_norm = fro_norm / (batchimg.shape[1] * batchimg.shape[2])
-    return torch.mean(fro_norm)
+    B, C, H, W = diff.shape
+    fro = torch.sum(diff * diff, dim=(1, 2, 3)) / (C * H * W)
+    return fro.mean()
+
 
 
 # -------------------------- 辅助损失函数（保持不变） --------------------------
@@ -124,6 +125,7 @@ def save_images_to_folder(img1, img2, fused_img, gt_img, epoch, batch_idx, mean,
     
     def denormalize(tensor):
         """反归一化：恢复到[0,1]范围"""
+        tensor = tensor.detach()
         tensor = tensor * std.view(3, 1, 1) + mean.view(3, 1, 1)
         return torch.clamp(tensor, 0.0, 1.0)
     
@@ -154,6 +156,7 @@ def log_images_to_tensorboard(writer, img1, img2, fused_img, gt_img, epoch, batc
     gt_sample = gt_img[sample_idx]
     
     def denormalize(tensor):
+        tensor = tensor.detach()
         tensor = tensor * std.view(3, 1, 1) + mean.view(3, 1, 1)
         return torch.clamp(tensor, 0.0, 1.0)
     
@@ -205,7 +208,11 @@ def train_integrated_model(P):
     print("\n[2/5] 初始化多聚焦融合模型...")
     model = MultiFocusFusionModel(
         block_size=P['block_size'],
-        overlap=P['overlap']
+        overlap=P['overlap'],
+        clip_patch_size=P.get('clip_patch_size', 32),
+        clip_stride=P.get('clip_stride', 16),
+        clip_weight=P.get('clip_weight', 0.6),
+        train_backbone=P.get('train_backbone', False)
     ).to(P['device'])
     print(f"✅ 模型初始化完成，参数总数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
@@ -236,9 +243,19 @@ def train_integrated_model(P):
     log_interval = 5  # 每5个批次记录一次TensorBoard图像
     save_image_interval = 1  # 每1个epoch保存一次图像
     
+    default_loss_weights = {
+        'ssim': 2.0,
+        'l2': 1.0,
+        'fro': 0.1,
+        'focus_acc': 1.5,
+        'smooth': 0.1
+    }
+    loss_weights = {**default_loss_weights, **P.get('loss_weights', {})}
+    grad_clip = P.get('grad_clip', 1.0)
+
     for epoch in range(P['num_epochs']):
         model.train()  # 确保模型处于训练模式
-        train_metrics = {'total': 0, 'ssim': 0, 'l2': 0, 'fro': 0, 'focus_acc': 0, 'smooth': 0}
+        train_metrics = {'total': 0, 'ssim': 0, 'l2': 0, 'fro': 0, 'focus_acc': 0, 'smooth': 0, 'grad_norm': 0}
         
         # 遍历训练集批次
         for batch_idx, (img1, img2, gt_img) in enumerate(tqdm(
@@ -269,24 +286,30 @@ def train_integrated_model(P):
                 loss_focus_acc = create_focus_accuracy_loss(focus_maps, img1, img2, gt_img)
                 loss_smooth = create_smoothness_loss(focus_maps)
                 
-                # 总损失（权重与原逻辑保持一致）
-                total_loss = (1.0 * loss_ssim +
-                              0.5 * loss_l2 +
-                              0.3 * loss_fro +
-                              2.0 * loss_focus_acc +
-                              0.2 * loss_smooth)
-            
+                # 加权总损失（可配置权重）
+                total_loss = (
+                    loss_weights['ssim'] * loss_ssim +
+                    loss_weights['l2'] * loss_l2 +
+                    loss_weights['fro'] * loss_fro +
+                    loss_weights['focus_acc'] * loss_focus_acc +
+                    loss_weights['smooth'] * loss_smooth
+                )
+
             # 反向传播与参数更新
+            grad_norm_value = 0.0
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm_value = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm_value = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 optimizer.step()
+
+            if isinstance(grad_norm_value, torch.Tensor):
+                grad_norm_value = grad_norm_value.item()
             
             # 累计训练指标（用于计算epoch平均损失）
             train_metrics['total'] += total_loss.item()
@@ -295,6 +318,7 @@ def train_integrated_model(P):
             train_metrics['fro'] += loss_fro.item()
             train_metrics['focus_acc'] += loss_focus_acc.item()
             train_metrics['smooth'] += loss_smooth.item()
+            train_metrics['grad_norm'] += grad_norm_value
             
             # 定期记录图像到TensorBoard
             if batch_idx % log_interval == 0:
@@ -325,6 +349,7 @@ def train_integrated_model(P):
         print(f"  - Frobenius损失: {train_metrics['fro']:.4f}")
         print(f"  - 聚焦准确性损失: {train_metrics['focus_acc']:.4f}")
         print(f"  - 平滑性损失: {train_metrics['smooth']:.4f}")
+        print(f"  - 梯度范数: {train_metrics['grad_norm']:.4f}")
         print(f"当前学习率: {scheduler.get_last_lr()[0]:.6f}")
         
         # 记录训练指标到TensorBoard
@@ -335,6 +360,7 @@ def train_integrated_model(P):
         writer.add_scalar('Loss/Focus_Acc_Train', train_metrics['focus_acc'], epoch)
         writer.add_scalar('Loss/Smooth_Train', train_metrics['smooth'], epoch)
         writer.add_scalar('LearningRate', scheduler.get_last_lr()[0], epoch)
+        writer.add_scalar('Grad/Norm', train_metrics['grad_norm'], epoch)
         
         # 保存当前epoch的融合图像（便于可视化训练过程）
         if epoch % save_image_interval == 0:
@@ -391,7 +417,19 @@ if __name__ == '__main__':
         'data_dir': './data/MFI-WHU',            # MFI-WHU数据集根目录（含source_1/source_2/full_clear）
         'num_workers': 2,         # 数据加载线程数（建议不超过CPU核心数）
         'block_size': 32,         # 模型块大小（与modelv2.py保持一致）
-        'overlap': 4              # 模型块重叠率（与modelv2.py保持一致）
+        'overlap': 4,             # 模型块重叠率（与modelv2.py保持一致）
+        'clip_patch_size': 32,    # CLIP 评估的切片大小
+        'clip_stride': 16,        # 切片滑动步幅
+        'clip_weight': 0.6,       # CLIP 焦点图占比（其余由可训练焦点头决定）
+        'train_backbone': True,   # 是否联合训练ResNet backbone
+        'grad_clip': 1.0,         # 梯度裁剪阈值
+        'loss_weights': {         # 可按需微调各损失项权重
+            'ssim': 2.0,
+            'l2': 1.0,
+            'fro': 0.1,
+            'focus_acc': 1.5,
+            'smooth': 0.1
+        }
     }
     
     # 确保保存目录存在
