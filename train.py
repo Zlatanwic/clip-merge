@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter  
 from torch.optim.lr_scheduler import StepLR
+from torch.cuda.amp import autocast, GradScaler
 import os
 from tqdm import tqdm
 import numpy as np
@@ -77,19 +78,26 @@ def create_smoothness_loss(focus_maps):
 
 def create_focus_accuracy_loss(focus_maps, source1, source2, gt):
     """聚焦准确性损失：匹配理想聚焦图"""
-    def calculate_sharpness(img):
-        """计算图像清晰度（拉普拉斯算子）"""
-        gray = torch.mean(img, dim=1, keepdim=True) if len(img.shape)==4 else img.unsqueeze(0)
-        laplacian = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], device=img.device).view(1,1,3,3).float()
-        return torch.abs(F.conv2d(gray, laplacian, padding=1))
-    
-    sharp1 = calculate_sharpness(source1)
-    sharp2 = calculate_sharpness(source2)
-    # 理想聚焦图（基于清晰度分配权重）
-    ideal_focus1 = sharp1 / (sharp1 + sharp2 + 1e-8)
-    ideal_focus2 = sharp2 / (sharp1 + sharp2 + 1e-8)
-    # MSE损失匹配预测与理想聚焦图
-    return F.mse_loss(focus_maps[:,0:1], ideal_focus1) + F.mse_loss(focus_maps[:,1:2], ideal_focus2)
+    with autocast(enabled=False):
+        focus_maps = focus_maps.to(torch.float32)
+        source1 = source1.to(torch.float32)
+        source2 = source2.to(torch.float32)
+
+        def calculate_sharpness(img):
+            """计算图像清晰度（拉普拉斯算子）"""
+            gray = torch.mean(img, dim=1, keepdim=True) if img.dim() == 4 else img.unsqueeze(0)
+            laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=img.device, dtype=torch.float32).view(1, 1, 3, 3)
+            return torch.abs(F.conv2d(gray, laplacian, padding=1))
+
+        sharp1 = calculate_sharpness(source1)
+        sharp2 = calculate_sharpness(source2)
+        denom = sharp1 + sharp2
+        denom = torch.where(denom == 0, torch.full_like(denom, 1e-6), denom)
+        ideal_focus1 = sharp1 / denom
+        ideal_focus2 = sharp2 / denom
+        loss = (F.mse_loss(focus_maps[:, 0:1], ideal_focus1) +
+                F.mse_loss(focus_maps[:, 1:2], ideal_focus2))
+    return loss
 
 
 # -------------------------- 辅助函数（图像日志、保存、归一化检查） --------------------------
@@ -164,7 +172,9 @@ def log_images_to_tensorboard(writer, img1, img2, fused_img, gt_img, epoch, batc
 
 # -------------------------- 训练主函数（移除所有验证逻辑） --------------------------
 def train_integrated_model(P):
-    torch.autograd.set_detect_anomaly(True)
+    detect_anomaly = P.get('detect_anomaly', False)
+    if detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
     os.makedirs(P['save_dir'], exist_ok=True)
     
     # 创建融合图像保存目录
@@ -205,6 +215,13 @@ def train_integrated_model(P):
     optimizer = optim.Adam(trainable_params, lr=P['lr'])
     scheduler = StepLR(optimizer, step_size=20, gamma=0.5)  # 每20轮学习率减半
     print(f"✅ 优化器: Adam (lr={P['lr']}), 调度器: StepLR (step_size=20, gamma=0.5)")
+    amp_device_available = torch.cuda.is_available() and 'cuda' in str(P['device']).lower()
+    requested_amp = P.get('use_amp', amp_device_available)
+    use_amp = requested_amp and amp_device_available
+    if requested_amp and not amp_device_available:
+        print("⚠️ 检测到非 CUDA 设备，自动混合精度已自动关闭")
+    scaler = GradScaler(enabled=use_amp)
+    print(f"⚙️ 自动混合精度: {'开启' if use_amp else '关闭'}")
     
     # 4. 初始化TensorBoard日志
     log_dir = os.path.join(P['save_dir'], 'tensorboard_logs')
@@ -235,32 +252,41 @@ def train_integrated_model(P):
                 check_normalization(img2, 'img2', epoch, writer)
                 check_normalization(gt_img, 'gt_img', epoch, writer)
             
-            # 前向传播：生成融合图像和聚焦图
-            fused_img, focus_maps = model(img1, img2)
+            optimizer.zero_grad(set_to_none=True)
             
-            # 检查融合图像归一化情况
-            if epoch % 10 == 0 and batch_idx == 0:
-                check_normalization(fused_img, 'fused_img', epoch, writer)
-            
-            # 计算各损失分量
-            loss_ssim = SSIM_LOSS(fused_img, gt_img)
-            loss_l2 = L2_LOSS(fused_img - gt_img)
-            loss_fro = Fro_LOSS(fused_img - gt_img)
-            loss_focus_acc = create_focus_accuracy_loss(focus_maps, img1, img2, gt_img)
-            loss_smooth = create_smoothness_loss(focus_maps)
-            
-            # 总损失（权重与原逻辑保持一致）
-            total_loss = (1.0 * loss_ssim +           
-                         0.5 * loss_l2 +             
-                         0.3 * loss_fro +            
-                         2.0 * loss_focus_acc +      
-                         0.2 * loss_smooth)          
+            with autocast(enabled=use_amp):
+                # 前向传播：生成融合图像和聚焦图
+                fused_img, focus_maps = model(img1, img2)
+                
+                # 检查融合图像归一化情况
+                if epoch % 10 == 0 and batch_idx == 0:
+                    check_normalization(fused_img, 'fused_img', epoch, writer)
+                
+                # 计算各损失分量
+                loss_ssim = SSIM_LOSS(fused_img, gt_img)
+                loss_l2 = L2_LOSS(fused_img - gt_img)
+                loss_fro = Fro_LOSS(fused_img - gt_img)
+                loss_focus_acc = create_focus_accuracy_loss(focus_maps, img1, img2, gt_img)
+                loss_smooth = create_smoothness_loss(focus_maps)
+                
+                # 总损失（权重与原逻辑保持一致）
+                total_loss = (1.0 * loss_ssim +
+                              0.5 * loss_l2 +
+                              0.3 * loss_fro +
+                              2.0 * loss_focus_acc +
+                              0.2 * loss_smooth)
             
             # 反向传播与参数更新
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪防止爆炸
-            optimizer.step()
+            if use_amp:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             
             # 累计训练指标（用于计算epoch平均损失）
             train_metrics['total'] += total_loss.item()
@@ -359,6 +385,8 @@ if __name__ == '__main__':
         'num_epochs': 50,         # 训练轮数
         'lr': 5e-4,               # 初始学习率
         'device': device,         # 训练设备（cuda/cpu）
+        'use_amp': True,          # 是否启用自动混合精度
+        'detect_anomaly': False,  # 是否开启梯度异常检测
         'save_dir': './checkpoints_mfiwh_full',  # 模型/日志保存目录
         'data_dir': './data/MFI-WHU',            # MFI-WHU数据集根目录（含source_1/source_2/full_clear）
         'num_workers': 2,         # 数据加载线程数（建议不超过CPU核心数）

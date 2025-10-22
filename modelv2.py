@@ -94,13 +94,12 @@ class CLIPFocusClassifier(nn.Module):
     """基于CLIP的清晰/模糊二分类分类器"""
     def __init__(self, device='cuda'):
         super(CLIPFocusClassifier, self).__init__()
-        
-        # 加载CLIP模型
         self.device = device
-        import clip  # 确保clip库可用
+        import clip
         self.clip_model, self.preprocess = clip.load("ViT-B/32", device=device)
-        
-        # 用于分类的文本提示
+        self.clip_model.eval()
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
         self.clear_prompts = [
             "a clear and sharp image",
             "a focused photograph",
@@ -108,116 +107,129 @@ class CLIPFocusClassifier(nn.Module):
             "a well-focused picture",
             "a sharp and clear photo"
         ]
-        
         self.unclear_prompts = [
             "a blurry and unclear image",
-            "an unfocused photograph", 
+            "an unfocused photograph",
             "a fuzzy and unclear image",
             "a blurry picture",
             "an out of focus photo"
         ]
-        
-        # 对文本提示编码
         self.clear_text_features = self._encode_text_prompts(self.clear_prompts)
         self.unclear_text_features = self._encode_text_prompts(self.unclear_prompts)
-        
+        self.dataset_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        self.dataset_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        self.clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        self.clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        self.clip_input_size = 224
+        self.patch_batch_size = 256
+        self.tensor_transform = transforms.Compose([
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
     def _encode_text_prompts(self, prompts):
-        """Encode text prompts to CLIP features"""
-        import clip  # 确保clip库可用
+        import clip
         text_tokens = clip.tokenize(prompts).to(self.device)
         with torch.no_grad():
             text_features = self.clip_model.encode_text(text_tokens)
             text_features = F.normalize(text_features, dim=-1)
         return text_features
-    
+
     def encode_image(self, image):
-        """将图像编码为 CLIP 特征"""
         if isinstance(image, str):
-            # 加载图像
             image = Image.open(image).convert('RGB')
-        
-        # 图像预处理
         image_input = self.preprocess(image).unsqueeze(0).to(self.device)
-        
-        # 图像编码器
         with torch.no_grad():
             image_features = self.clip_model.encode_image(image_input)
             image_features = F.normalize(image_features, dim=-1)
-        
         return image_features
-    
+
     def classify_focus(self, image):
-        """
-        判断图像是清晰还是模糊
-        
-        返回：focus_score: 0-1 之间的浮点数（0 表示模糊，1 表示清晰）
-        """
-        image_features = self.encode_image(image)
-        
-        # 计算与“清晰”和“模糊”提示文本的相似度
-        clear_similarity = torch.cosine_similarity(image_features, self.clear_text_features, dim=1)
-        unclear_similarity = torch.cosine_similarity(image_features, self.unclear_text_features, dim=1)
-        
-        # 取每个类别的最大相似度
-        max_clear_sim = torch.max(clear_similarity)
-        max_unclear_sim = torch.max(unclear_similarity)
-        
-        # 计算焦点分数（归一化到0-1之间）
-        focus_score = max_clear_sim / (max_clear_sim + max_unclear_sim + 1e-8)
-        
-        # 计算置信度
-        confidence = torch.max(max_clear_sim, max_unclear_sim)
-        
-        return focus_score.item(), confidence.item()
-    
-    def get_pixel_focus_map(self, image, patch_size=32, stride=16):
-        """
-        使用滑动窗口 CLIP 分类生成像素级焦点图
-        """
         if isinstance(image, torch.Tensor):
-            # 如果是张量，转换为 PIL 图像
-            image = self._tensor_to_pil(image)
-        elif isinstance(image, str):
-            image = Image.open(image).convert('RGB')
-        
-        img_array = np.array(image)
-        h, w = img_array.shape[:2]
-        
-        focus_map = np.zeros((h, w))
-        count_map = np.zeros((h, w))
-        
-        # 遍历图像，使用滑动窗口分类每个块
-        for i in range(0, h - patch_size + 1, stride):
-            for j in range(0, w - patch_size + 1, stride):
-                # 提取块
-                patch = image.crop((j, i, j + patch_size, i + patch_size))
-                
-                # 分类块
-                focus_score, _ = self.classify_focus(patch)
-                
-                # 将焦点分数添加到焦点图
-                focus_map[i:i+patch_size, j:j+patch_size] += focus_score
-                count_map[i:i+patch_size, j:j+patch_size] += 1
-        
-        # 计算平均焦点分数
-        focus_map = np.divide(focus_map, count_map, where=count_map > 0)
-        
-        return focus_map
-    
+            patches = image.unsqueeze(0)
+        else:
+            if isinstance(image, str):
+                image = Image.open(image).convert('RGB')
+            if isinstance(image, Image.Image):
+                patches = self.tensor_transform(image).unsqueeze(0)
+            else:
+                raise TypeError(f"Unsupported image type: {type(image)}")
+        scores, confidences = self.batch_classify_focus(patches)
+        return scores[0].item(), confidences[0].item()
+
+    def batch_classify_focus(self, patches):
+        focus_scores, confidences = self._compute_focus_scores(patches)
+        return focus_scores, confidences
+
+    def _compute_focus_scores(self, patches):
+        if patches.numel() == 0:
+            empty = torch.empty(0, device=self.device)
+            return empty, empty
+        patches = patches.to(self.device)
+        patches = patches * self.dataset_std + self.dataset_mean
+        patches = torch.clamp(patches, 0.0, 1.0)
+        focus_scores = []
+        confidences = []
+        for chunk in patches.split(self.patch_batch_size, dim=0):
+            chunk = F.interpolate(chunk, size=self.clip_input_size, mode='bilinear', align_corners=False)
+            chunk = (chunk - self.clip_mean) / self.clip_std
+            with torch.no_grad():
+                features = self.clip_model.encode_image(chunk)
+                features = F.normalize(features, dim=-1)
+            clear_similarity = features @ self.clear_text_features.t()
+            unclear_similarity = features @ self.unclear_text_features.t()
+            max_clear_sim, _ = clear_similarity.max(dim=1)
+            max_unclear_sim, _ = unclear_similarity.max(dim=1)
+            focus_score = max_clear_sim / (max_clear_sim + max_unclear_sim + 1e-8)
+            confidence = torch.maximum(max_clear_sim, max_unclear_sim)
+            focus_scores.append(focus_score)
+            confidences.append(confidence)
+        focus_scores = torch.cat(focus_scores, dim=0)
+        confidences = torch.cat(confidences, dim=0)
+        return focus_scores, confidences
+
+    def get_pixel_focus_map(self, image, patch_size=32, stride=16):
+        if isinstance(image, torch.Tensor):
+            tensor = image
+        else:
+            if isinstance(image, str):
+                image = Image.open(image).convert('RGB')
+            if isinstance(image, Image.Image):
+                tensor = self.tensor_transform(image)
+            else:
+                raise TypeError(f"Unsupported image type: {type(image)}")
+        return self._get_pixel_focus_map_tensor(tensor, patch_size, stride)
+
+    def _get_pixel_focus_map_tensor(self, tensor, patch_size, stride):
+        if tensor.dim() != 3:
+            raise ValueError(f"Expected tensor shape (3, H, W), got {tensor.shape}")
+        c, h, w = tensor.shape
+        device = tensor.device
+        tensor = tensor.unsqueeze(0)
+        patches = F.unfold(tensor, kernel_size=patch_size, stride=stride)
+        L = patches.shape[-1]
+        if L == 0:
+            raise ValueError("Patch size larger than image.")
+        patches = patches.squeeze(0).transpose(0, 1).contiguous().view(L, c, patch_size, patch_size)
+        focus_scores, _ = self._compute_focus_scores(patches)
+        focus_scores = focus_scores.view(1, 1, L)
+        focus_patches = focus_scores.repeat(1, patch_size * patch_size, 1)
+        focus_map = F.fold(focus_patches, output_size=(h, w), kernel_size=patch_size, stride=stride)
+        count_patches = torch.ones((1, patch_size * patch_size, L), device=device, dtype=focus_map.dtype)
+        count_map = F.fold(count_patches, output_size=(h, w), kernel_size=patch_size, stride=stride)
+        focus_map = focus_map / (count_map + 1e-8)
+        return focus_map.squeeze(0).squeeze(0)
+
     def _tensor_to_pil(self, tensor):
-        """将张量转换为 PIL 图像"""
         device = tensor.device
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
         tensor = tensor * std + mean
-        
         tensor = tensor.cpu().clamp(0, 1)
         tensor = (tensor * 255).byte()
         image = Image.fromarray(tensor.permute(1, 2, 0).numpy())
         return image
-
-
-# 引入你提供的CLIPPixelFusion（适配原模型输出格式）
 class CLIPPixelFusion(nn.Module):
     """基于 CLIP 的像素级焦点融合模型（适配原模型输出）"""
     def __init__(self, device='cuda', patch_size=32, stride=16):
@@ -238,16 +250,22 @@ class CLIPPixelFusion(nn.Module):
             focus_map1 = self.clip_model.get_pixel_focus_map(img1[b], self.patch_size, self.stride)
             focus_map2 = self.clip_model.get_pixel_focus_map(img2[b], self.patch_size, self.stride)
             
-            focus_map1_tensor = torch.from_numpy(focus_map1).float().to(self.device)
-            focus_map2_tensor = torch.from_numpy(focus_map2).float().to(self.device)
+            focus_map1_tensor = focus_map1.unsqueeze(0).unsqueeze(0).float().to(self.device)
+            focus_map2_tensor = focus_map2.unsqueeze(0).unsqueeze(0).float().to(self.device)
             
             # 焦点图插值到原图大小
-            focus_map1_tensor = F.interpolate(focus_map1_tensor.unsqueeze(0).unsqueeze(0), 
-                                            size=(img1.shape[2], img1.shape[3]), 
-                                            mode='bilinear', align_corners=False)
-            focus_map2_tensor = F.interpolate(focus_map2_tensor.unsqueeze(0).unsqueeze(0), 
-                                            size=(img2.shape[2], img2.shape[3]), 
-                                            mode='bilinear', align_corners=False)
+            focus_map1_tensor = F.interpolate(
+                focus_map1_tensor,
+                size=(img1.shape[2], img1.shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
+            focus_map2_tensor = F.interpolate(
+                focus_map2_tensor,
+                size=(img2.shape[2], img2.shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
             
             focus_maps = torch.cat([focus_map1_tensor, focus_map2_tensor], dim=1)  # [1, 2, H, W]
             
