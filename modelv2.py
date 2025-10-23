@@ -32,61 +32,35 @@ class FeatureExtractor(nn.Module):
 
 # 保留原模型的GradientVarianceFocusHead（未修改）
 class GradientVarianceFocusHead(nn.Module):
-    """梯度-方差混合聚焦头：修正尺寸不匹配问题"""
     def __init__(self, in_channels=64):
         super().__init__()
-        # 可学习参数：平衡梯度和方差的权重
-        self.alpha = nn.Parameter(torch.tensor(0.5))  # 初始值0.5，范围会自动学习
-        # 1x1卷积用于特征映射（增强表达能力）
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1, stride=1, padding=0)
-        
-        # 预定义Sobel算子（注册为缓冲区，避免每次forward重新创建）
-        self.register_buffer(
-            'sobel_x', 
-            torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        # 用小头产生 1 通道 logits
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 8, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, 3, padding=1),
         )
-        self.register_buffer(
-            'sobel_y', 
-            torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        )
+        self.register_buffer('sobel_x', torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).view(1,1,3,3))
+        self.register_buffer('sobel_y', torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32).view(1,1,3,3))
 
-    def forward(self, x):
-        # x: (B, in_channels, H, W) - 来自特征提取器的输出
-        
-        # 1. 计算梯度特征（边缘锐利度）
-        # 关键修复：添加padding=1，确保卷积后尺寸与输入一致
-        grad_x = F.conv2d(
-            x, 
-            self.sobel_x.repeat(x.shape[1], 1, 1, 1),  # 扩展到输入通道数
-            groups=x.shape[1], 
-            padding=1  # 新增padding，解决尺寸不匹配
-        )
-        grad_y = F.conv2d(
-            x, 
-            self.sobel_y.repeat(x.shape[1], 1, 1, 1), 
-            groups=x.shape[1], 
-            padding=1  # 新增padding，解决尺寸不匹配
-        )
-        # 计算梯度强度并在通道维度平均
-        grad = torch.mean(torch.abs(grad_x) + torch.abs(grad_y), dim=1, keepdim=True)  # (B, 1, H, W)
-        
-        # 2. 计算方差特征（纹理丰富度）
-        x_mean = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)  # 保持尺寸
-        x_var = F.avg_pool2d((x - x_mean) **2, kernel_size=3, stride=1, padding=1)  # 保持尺寸
-        var = torch.mean(x_var, dim=1, keepdim=True)  # (B, 1, H, W)
-        
-        # 3. 生成聚焦掩码（确保grad_norm和var_norm尺寸相同）
-        grad_norm = F.sigmoid(grad)  # 归一化到[0,1]
-        var_norm = F.sigmoid(var)    # 归一化到[0,1]
-        
-        # 融合梯度和方差信息（现在尺寸匹配，可以安全相加）
-        mask = self.alpha * grad_norm + (1 - self.alpha) * var_norm
-        mask = F.sigmoid(mask)  # 最终掩码，强化区分度
-        
-        # 4. 特征加权（增强清晰区域特征）
-        x_focus = x * mask.repeat(1, x.shape[1], 1, 1)  # 扩展掩码到输入通道数
-        
-        return x_focus, mask
+    def forward(self, x):  # x: [B,C,H,W]
+        grad_x = F.conv2d(x, self.sobel_x.repeat(x.size(1),1,1,1), groups=x.size(1), padding=1)
+        grad_y = F.conv2d(x, self.sobel_y.repeat(x.size(1),1,1,1), groups=x.size(1), padding=1)
+        grad = (grad_x.abs() + grad_y.abs()).mean(dim=1, keepdim=True)     # [B,1,H,W]
+
+        x_mean = F.avg_pool2d(x, 3, stride=1, padding=1)
+        var = ((x - x_mean)**2).mean(dim=1, keepdim=True)                  # [B,1,H,W]
+
+        # 归一化到 [0,1]，但不再最终 sigmoid 当权重
+        grad_n = torch.sigmoid(grad)
+        var_n  = torch.sigmoid(var)
+
+        stats = torch.cat([grad_n, var_n], dim=1)  # [B,2,H,W]
+        logits = self.conv(stats)                  # [B,1,H,W] —— 可学习 logits
+
+        return logits  # 注意：返回 logits，而不是 mask
+
 
 
 # 引入你提供的新CLIP模型
@@ -312,45 +286,41 @@ class MultiFocusFusionModel(nn.Module):
         """
         输入: 两张多聚焦图像 (B, 3, H, W)
         输出: 
-            fused_img: 融合图像 (B, 3, H, W)
-            focus_maps: 聚焦掩码 (B, 2, H, W)，[:,0]对应img1权重，[:,1]对应img2权重
+            fused_img: (B, 3, H, W)
+            focus_maps: (B, 2, H, W)
         """
         B, C, H, W = img1.shape
-        
-        # 1. 保留原特征提取与聚焦掩码（局部聚焦信息）
-        # 图1处理
-        feat1 = self.feature_extractor(img1)  # (B, 64, H/4, W/4)
-        feat1_focus, mask1 = self.focus_head(feat1)  # mask1: (B, 1, H/4, W/4)
-        
-        # 图2处理
+
+        # 1. 局部特征提取
+        feat1 = self.feature_extractor(img1)  # (B,64,H/4,W/4)
         feat2 = self.feature_extractor(img2)
-        feat2_focus, mask2 = self.focus_head(feat2)  # mask2: (B, 1, H/4, W/4)
-        
-        # 2. 使用CLIP生成软焦点图
-        clip_focus_maps = self.clip_fusion(img1, img2)
 
-        # 3. 保留原聚焦掩码优化逻辑（融合CLIP结果与低级特征）
-        mask1_up = F.interpolate(mask1, size=(H, W), mode='bilinear')
-        mask2_up = F.interpolate(mask2, size=(H, W), mode='bilinear')
+        # ❗ focus_head 现在返回 logits（单返回值）
+        logit1 = self.focus_head(feat1)       # (B,1,H/4,W/4)
+        logit2 = self.focus_head(feat2)       # (B,1,H/4,W/4)
 
-        base_focus = torch.cat([mask1_up, mask2_up], dim=1)
-        clip_focus = clip_focus_maps
+        # 2. CLIP 软焦点（不可微先验）
+        with torch.no_grad():
+            clip_focus_maps = self.clip_fusion(img1, img2).detach()  # (B,2,H,W)
+            clip_focus_maps = torch.clamp(clip_focus_maps, min=1e-6, max=1.0)
 
-        base_focus = torch.clamp(base_focus, min=1e-6)
-        base_focus = base_focus / (base_focus.sum(dim=1, keepdim=True) + 1e-6)
+        # 3. 可微基础 logits（注意：这里是 logits，不是概率，不要 clamp/log）
+        logit1_up = F.interpolate(logit1, size=(H, W), mode='bilinear', align_corners=False)
+        logit2_up = F.interpolate(logit2, size=(H, W), mode='bilinear', align_corners=False)
+        base_logits = torch.cat([logit1_up, logit2_up], dim=1)  # (B,2,H,W)
 
-        combined_focus = (
-            self.clip_weight * clip_focus + (1.0 - self.clip_weight) * base_focus
-        )
-        combined_focus = torch.clamp(combined_focus, min=1e-6)
-        final_focus_maps = combined_focus / (combined_focus.sum(dim=1, keepdim=True) + 1e-6)
+        # 4. CLIP 先验转成 logits 偏置 + softmax 融合
+        clip_prior_logits = torch.log(clip_focus_maps)  # 先验是概率，取 log 成为 logits 偏置
+        clip_gate = self.clip_weight                 # 建议先设 0.2 ~ 0.3
+        combined_logits = (1.0 - clip_gate) * base_logits + clip_gate * clip_prior_logits
 
-        fused_img = (
-            final_focus_maps[:, 0:1] * img1 +
-            final_focus_maps[:, 1:2] * img2
-        )
+        final_focus_maps = torch.softmax(combined_logits, dim=1)  # (B,2,H,W)
 
+        # 5. 融合
+        fused_img = final_focus_maps[:, 0:1] * img1 + final_focus_maps[:, 1:2] * img2
         return fused_img, final_focus_maps
+
+
 
 
 # 测试代码（验证输出格式兼容性）
