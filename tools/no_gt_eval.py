@@ -2,7 +2,7 @@ import argparse
 import csv
 import os
 from typing import Dict, Iterable, List, Optional, Tuple
-
+from scipy.ndimage import sobel
 import numpy as np
 from PIL import Image
 from scipy.stats import pearsonr
@@ -16,22 +16,26 @@ def read_gray(path: str, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
     img = Image.open(path).convert("L")
     if size is not None and img.size != (size[1], size[0]):
         img = img.resize((size[1], size[0]), Image.BILINEAR)
-    return np.asarray(img, dtype=np.float32) / 255.0
+    return np.asarray(img, dtype=np.float32) 
 
 
-def mutual_information(img1: np.ndarray, img2: np.ndarray, bins: int = 256) -> float:
-    hgram, _, _ = np.histogram2d(img1.ravel(), img2.ravel(), bins=bins)
-    pxy = hgram / np.sum(hgram)
+def mutual_information(img1, img2, bins=256):
+    eps = 1e-12
+    hgram, _, _ = np.histogram2d(img1.ravel(), img2.ravel(), bins=bins, range=[[0, 255], [0, 255]])
+    pxy = hgram / (np.sum(hgram) + eps)
     px = np.sum(pxy, axis=1)
     py = np.sum(pxy, axis=0)
-    px_py = np.outer(px, py)
+    px_py = np.outer(px, py) + eps
     nzs = pxy > 0
     return float(np.sum(pxy[nzs] * np.log2(pxy[nzs] / px_py[nzs])))
 
 
-def correlation_coeff(img1: np.ndarray, img2: np.ndarray) -> float:
-    r, _ = pearsonr(img1.ravel(), img2.ravel())
-    return float(r)
+
+def correlation_coeff(img1, img2):
+    a = img1.ravel() - np.mean(img1)
+    b = img2.ravel() - np.mean(img2)
+    denom = (np.std(a) * np.std(b) + 1e-12)
+    return float(np.mean(a * b) / denom)
 
 
 def spatial_frequency(img: np.ndarray) -> float:
@@ -47,9 +51,9 @@ def average_gradient(img: np.ndarray) -> float:
 
 def q_abf(imgA: np.ndarray, imgB: np.ndarray, fused: np.ndarray) -> float:
     eps = 1e-8
-    grad_xA, grad_yA = np.gradient(imgA)
-    grad_xB, grad_yB = np.gradient(imgB)
-    grad_xF, grad_yF = np.gradient(fused)
+    grad_xA, grad_yA = sobel(imgA, axis=1), sobel(imgA, axis=0)
+    grad_xB, grad_yB = sobel(imgB, axis=1), sobel(imgB, axis=0)
+    grad_xF, grad_yF = sobel(fused, axis=1), sobel(fused, axis=0)
 
     magA = np.sqrt(grad_xA**2 + grad_yA**2) + eps
     magB = np.sqrt(grad_xB**2 + grad_yB**2) + eps
