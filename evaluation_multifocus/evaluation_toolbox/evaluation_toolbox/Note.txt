@@ -1,0 +1,19 @@
+1.metricXydeas:
+1）AAF的计算按照EL论文公式4为准，修改；
+2）参数的设置，按照EL论文Figure 1为准，修改；
+3）最后一步指标的平均，按照EL论文公式8为准，修改。
+
+另有，flt1和flt2的顺序是按照SPIE论文顺序，也是符合通常水平和垂直方向梯度Sobel算子的顺序，这里与Xiaobo Qu公开的QABF的代码不同，会使得两者结果有微小差异（0.01左右）。如果调整顺序一致，且注意到这里用的是filter2，而Xiaobo Qu的实现用的是conv2（两者差异在于卷积核要旋转180度），两者最终的计算结果完全一致。
+
+
+2. metricPeilla：
+1）case 3中Q没有定义，将case 2的补充过来即可；
+2）Peilla的ICIP 2003原论文中使用的是UIQI （Z. Wang, IEEE SPL 2002)，而非SSIM （Z. Wang, IEEE TIP 2004)，这里用的是SSIM的默认参数（K和window大小），可以将K设置很小的值来使SSIM降为UIQI，ICIP 2003论文中window的大小是8*8。
+
+
+3. metricYang：
+1）存在分母为0导致NAN的问题。解决办法：找到分母为零的位置，取平均。
+
+
+4. metricCvejic:
+1) 存在分母为0导致NAN的问题。解决办法：找到分母为零的位置，取平均。
