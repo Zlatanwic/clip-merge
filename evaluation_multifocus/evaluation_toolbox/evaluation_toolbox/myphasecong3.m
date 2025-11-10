@@ -247,7 +247,7 @@ end
 
 for o = 1:norient                    % For each orientation.
 %   fprintf('Processing orientation %d\r',o);
-  if Octave fflush(1); end
+%  if Octave fflush(1); end
 
   angl = (o-1)*pi/norient;           % Filter angle.
   sumE_ThisOrient   = zero;          % Initialize accumulator matrices.

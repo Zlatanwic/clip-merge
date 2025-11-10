@@ -26,8 +26,8 @@ for kk=1:num_img
 %     name2=['F:\thinkingsFile\dataset\infrared and visible image fusion\ALL\test\vi\VIS_' num2str(h1) num2str(h2) num2str(h3) '.bmp'];
 %     name1=['F:\thinkingsFile\dataset\infrared and visible image fusion\verification\ir\IR_' num2str(h1) num2str(h2) num2str(h3) '.bmp']; 
 %     name2=['F:\thinkingsFile\dataset\infrared and visible image fusion\verification\vis\VIS_' num2str(h1) num2str(h2) num2str(h3) '.bmp'];
-    name1=['G:\dataset\multifocus\haveGT\test\renum\A\A_' num2str(h1) num2str(h2) num2str(h3) '.bmp']; 
-    name2=['G:\dataset\multifocus\haveGT\test\renum\B\B_' num2str(h1) num2str(h2) num2str(h3) '.bmp'];
+    name1=['D:\唐伟项目\work\代码\代码\CLIP_focus\CLIP_focus\renum\A\A_' num2str(h1) num2str(h2) num2str(h3) '.bmp']; 
+    name2=['D:\唐伟项目\work\代码\代码\CLIP_focus\CLIP_focus\renum\B\B_' num2str(h1) num2str(h2) num2str(h3) '.bmp'];
 
 %     namef=cell(1,num_alg);
     
@@ -38,7 +38,7 @@ for kk=1:num_img
 % %     
 %     namef=['F:\thinkingsFile\thinkingsTest\comparison\infrared and visible\test\SR\RoadScene\SR_' num2str(L2) num2str(L3) '.bmp'];
 % % %     
-    namef=['G:\COMPARISON\multi_focus\result\test\MFF_GAN\rgb\'  num2str(h1) num2str(h2) num2str(h3)  '.bmp'];
+    namef=['D:\唐伟项目\work\代码\代码\CLIP_focus\CLIP_focus\results\infer_only\'  num2str(h1) num2str(h2) num2str(h3)  '_fused.png'];
 % 
 %     namef{1}=['F:\thinkingsFile\thinkingsTest\fusionTransformer\code\20211026\models\120_1_ReNet_1e-4withoutWeightDecay_128_60_1ir_1vis_ssimVIS_ssimIR_3depthDARM\epoch10\'   num2str(h1) num2str(h2) num2str(h3) '.bmp'];
 %   
