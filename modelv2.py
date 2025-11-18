@@ -10,25 +10,228 @@ from qkcu import QKCU
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 保留原模型的FeatureExtractor（未修改）
-class FeatureExtractor(nn.Module):
-    """ResNet50第一层特征提取器（可选冻结，修复inplace激活问题）"""
-    def __init__(self, freeze=True):
+# class FeatureExtractor(nn.Module):
+#     """ResNet50第一层特征提取器（可选冻结，修复inplace激活问题）"""
+#     def __init__(self, freeze=True):
+#         super().__init__()
+#         resnet50 = models.resnet50(pretrained=True)
+#         # 关键修复：替换原ReLU为inplace=False的版本
+#         self.features = nn.Sequential(
+#             resnet50.conv1,  # 7x7卷积，输出64通道
+#             resnet50.bn1,
+#             nn.ReLU(inplace=False),  # 替换为非原地ReLU
+#             resnet50.maxpool  # 3x3 maxpool，输出尺寸减半
+#         )
+#         # 冻结参数
+#         if freeze:
+#             for param in self.features.parameters():
+#                 param.requires_grad = False
+
+#     def forward(self, x):
+#         return self.features(x)  # 现在ReLU不会原地修改输入
+
+
+class ChannelCrossAttention(nn.Module):
+    """模仿 MIHR 的通道级跨模态注意力 (Modality-Invariant Gating)
+    用于强化结构一致区域、抑制模糊噪声。
+    使用窗口注意力以节省内存。
+    """
+    def __init__(self, channels, window_size=16):
         super().__init__()
-        resnet50 = models.resnet50(pretrained=True)
-        # 关键修复：替换原ReLU为inplace=False的版本
-        self.features = nn.Sequential(
-            resnet50.conv1,  # 7x7卷积，输出64通道
-            resnet50.bn1,
-            nn.ReLU(inplace=False),  # 替换为非原地ReLU
-            resnet50.maxpool  # 3x3 maxpool，输出尺寸减半
-        )
-        # 冻结参数
-        if freeze:
-            for param in self.features.parameters():
-                param.requires_grad = False
+        self.query = nn.Conv2d(channels, channels, 1)
+        self.key   = nn.Conv2d(channels, channels, 1)
+        self.value = nn.Conv2d(channels, channels, 1)
+        self.proj  = nn.Conv2d(channels, channels, 1)
+        self.scale = channels ** -0.5
+        self.window_size = window_size
+        
+        # 初始化：使用Xavier初始化确保梯度流动
+        nn.init.xavier_uniform_(self.query.weight)
+        nn.init.xavier_uniform_(self.key.weight)
+        nn.init.xavier_uniform_(self.value.weight)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)  # 初始时gate接近0，残差连接更强
+
+    def forward(self, feat_a, feat_b):
+        """
+        feat_a: 当前模态 (B,C,H,W)
+        feat_b: 另一模态 (B,C,H,W)
+        """
+        B, C, H, W = feat_a.shape
+        q = self.query(feat_a)
+        k = self.key(feat_b)
+        v = self.value(feat_b)
+        
+        # 使用窗口注意力以节省内存
+        window_size = self.window_size
+        stride = window_size
+        out = torch.zeros_like(feat_a)
+        
+        for i in range(0, H, stride):
+            for j in range(0, W, stride):
+                # 确保不越界
+                h_end = min(i + window_size, H)
+                w_end = min(j + window_size, W)
+                h_win = h_end - i
+                w_win = w_end - j
+                
+                q_win = q[:, :, i:h_end, j:w_end]
+                k_win = k[:, :, i:h_end, j:w_end]
+                v_win = v[:, :, i:h_end, j:w_end]
+                
+                B_, C_, h, w = q_win.shape
+                q_ = q_win.reshape(B_, C_, h*w)           # [B,C,hw]
+                k_ = k_win.reshape(B_, C_, h*w)
+                v_ = v_win.reshape(B_, C_, h*w)
+                
+                # 计算注意力 [B,hw,hw] 而不是 [B,HW,HW]
+                attn = torch.softmax(torch.bmm(q_.transpose(1, 2), k_) * self.scale, dim=-1)
+                fused_win = torch.bmm(v_, attn.transpose(1, 2)).reshape(B_, C_, h, w)
+                
+                out[:, :, i:h_end, j:w_end] = fused_win
+        
+        # 使用残差连接：gate初始化为0附近，逐渐学习增强
+        gate = torch.sigmoid(self.proj(out))  # gating map in [0,1]
+        # 标准残差连接：feat_a + gate控制的融合特征
+        # 当gate=0时，完全保留原始特征；当gate增大时，逐渐融合新特征
+        return feat_a + gate * out  # 残差连接
+
+
+class GroupedChannelAttention(nn.Module):
+    """TBSN风格：分组通道自注意力 (Grouped Channel Self-Attention)"""
+    def __init__(self, channels, groups=4):
+        super().__init__()
+        assert channels % groups == 0, "channels must be divisible by groups"
+        self.groups = groups
+        self.softmax = nn.Softmax(dim=-1)
+        self.scale = (channels // groups) ** -0.5
+        self.to_qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        
+        # 初始化：使用Xavier初始化
+        nn.init.xavier_uniform_(self.to_qkv.weight)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def forward(self, x):
-        return self.features(x)  # 现在ReLU不会原地修改输入
+        B, C, H, W = x.shape
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        window_size = 16  # 每个小窗口内计算
+        stride = window_size
+        out = torch.zeros_like(x)
+
+        for i in range(0, H, stride):
+            for j in range(0, W, stride):
+                # 确保不越界
+                h_end = min(i + window_size, H)
+                w_end = min(j + window_size, W)
+                
+                q_win = q[:, :, i:h_end, j:w_end]
+                k_win = k[:, :, i:h_end, j:w_end]
+                v_win = v[:, :, i:h_end, j:w_end]
+
+                B_, C_, h, w = q_win.shape
+                q_ = q_win.reshape(B_, C_, h*w)
+                k_ = k_win.reshape(B_, C_, h*w)
+                v_ = v_win.reshape(B_, C_, h*w)
+
+                attn = torch.bmm(q_.transpose(1, 2), k_) * self.scale
+                attn = torch.softmax(attn, dim=-1)
+                out_win = torch.bmm(v_, attn.transpose(1, 2))
+                out_win = out_win.reshape(B_, C_, h, w)
+
+                out[:, :, i:h_end, j:w_end] = out_win
+
+        return self.proj(out) + x
+
+
+
+
+class DilatedFFN(nn.Module):
+    """模仿 TBSN 的膨胀卷积前馈网络 (Dilated FFN)"""
+    def __init__(self, channels, expand=4, dilation=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels * expand, 3, padding=dilation, dilation=dilation),
+            nn.GELU(),
+            nn.Conv2d(channels * expand, channels, 3, padding=dilation, dilation=dilation)
+        )
+        
+        # 初始化：最后一层初始化为接近0，确保残差连接初始时占主导
+        nn.init.xavier_uniform_(self.net[0].weight)
+        nn.init.zeros_(self.net[0].bias)
+        nn.init.xavier_uniform_(self.net[2].weight, gain=0.01)  # 小增益初始化
+        nn.init.zeros_(self.net[2].bias)
+
+    def forward(self, x):
+        return self.net(x) + x
+
+
+class HybridAttentionBlock(nn.Module):
+    """结合局部窗口注意力 + 通道注意力 + 空洞卷积FFN"""
+    def __init__(self, channels):
+        super().__init__()
+        self.local = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+        self.group_attn = GroupedChannelAttention(channels)
+        self.ffn = DilatedFFN(channels)
+
+    def forward(self, x):
+        local_feat = self.local(x)
+        out = self.group_attn(local_feat)
+        out = self.ffn(out)
+        return out
+
+
+# -------------------------------
+# 改进版 Feature Extractor 主体
+# -------------------------------
+
+class AttentionEnhancedFeatureExtractor(nn.Module):
+    """融合 MIHR + TBSN 思想的特征提取器"""
+    def __init__(self, freeze=True, channels=64):
+        super().__init__()
+        resnet50 = models.resnet50(pretrained=True)
+
+        # ✅ 使用 ResNet50 前四层提取底层纹理特征
+        self.stage1 = nn.Sequential(
+            resnet50.conv1,
+            resnet50.bn1,
+            nn.ReLU(inplace=False),
+            resnet50.maxpool,
+        )
+
+        # ✅ 引入注意力增强模块
+        self.hybrid_attn = HybridAttentionBlock(channels)
+        self.cross_attn = ChannelCrossAttention(channels)
+
+        # 可选冻结
+        if freeze:
+            for param in self.stage1.parameters():
+                param.requires_grad = False
+
+    def forward(self, img_a, img_b):
+        """
+        img_a, img_b: 两个焦距版本的图像
+        输出：
+            feat_a_att, feat_b_att: 注意力增强后的特征 (B,64,H/4,W/4)
+        """
+        feat_a = self.stage1(img_a)
+        feat_b = self.stage1(img_b)
+
+        # 局部+通道混合注意力增强
+        feat_a = self.hybrid_attn(feat_a)
+        feat_b = self.hybrid_attn(feat_b)
+
+        # 跨模态通道注意力增强（模仿 MIHR）
+        feat_a_att = self.cross_attn(feat_a, feat_b)
+        feat_b_att = self.cross_attn(feat_b, feat_a)
+
+        return feat_a_att, feat_b_att
+
+
+
 
 # 保留原模型的GradientVarianceFocusHead（未修改）
 class GradientVarianceFocusHead(nn.Module):
@@ -266,7 +469,8 @@ class MultiFocusFusionModel(nn.Module):
         self.overlap = overlap
         self.clip_weight = clip_weight
 
-        self.feature_extractor = FeatureExtractor(freeze=not train_backbone)
+        # self.feature_extractor = FeatureExtractor(freeze=not train_backbone)
+        self.feature_extractor = AttentionEnhancedFeatureExtractor(freeze=not train_backbone)
         self.focus_head = GradientVarianceFocusHead()
         self.qkcu = QKCU()
 
@@ -292,9 +496,9 @@ class MultiFocusFusionModel(nn.Module):
         B, C, H, W = img1.shape
 
         # 1. 局部特征提取
-        feat1 = self.feature_extractor(img1)  # (B,64,H/4,W/4)
-        feat2 = self.feature_extractor(img2)
-
+        # feat1 = self.feature_extractor(img1)  # (B,64,H/4,W/4)
+        # feat2 = self.feature_extractor(img2)
+        feat1, feat2 = self.feature_extractor(img1, img2)
         # ❗ focus_head 现在返回 logits（单返回值）
         logit1 = self.focus_head(feat1)       # (B,1,H/4,W/4)
         logit2 = self.focus_head(feat2)       # (B,1,H/4,W/4)
@@ -310,9 +514,11 @@ class MultiFocusFusionModel(nn.Module):
         base_logits = torch.cat([logit1_up, logit2_up], dim=1)  # (B,2,H,W)
 
         # 4. CLIP 先验转成 logits 偏置 + softmax 融合
-        clip_prior_logits = torch.log(clip_focus_maps)  # 先验是概率，取 log 成为 logits 偏置
-        clip_gate = self.clip_weight                 # 建议先设 0.2 ~ 0.3
-        combined_logits = (1.0 - clip_gate) * base_logits + clip_gate * clip_prior_logits
+        clip_prior_logits = torch.log(clip_focus_maps + 1e-8)  # 先验是概率，取 log 成为 logits 偏置
+        clip_gate = self.clip_weight                 # 降低CLIP权重，让可训练部分有更多学习空间
+        # 使用温度缩放，让logits更平滑
+        temperature = 1.0
+        combined_logits = ((1.0 - clip_gate) * base_logits + clip_gate * clip_prior_logits) / temperature
 
         final_focus_maps = torch.softmax(combined_logits, dim=1)  # (B,2,H,W)
 

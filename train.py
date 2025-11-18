@@ -420,9 +420,9 @@ if __name__ == '__main__':
         'overlap': 4,             # 模型块重叠率（与modelv2.py保持一致）
         'clip_patch_size': 32,    # CLIP 评估的切片大小
         'clip_stride': 16,        # 切片滑动步幅
-        'clip_weight': 0.6,       # CLIP 焦点图占比（其余由可训练焦点头决定）
+        'clip_weight': 0.3,       # CLIP 焦点图占比（降低以让可训练部分有更多学习空间，建议0.2-0.4）
         'train_backbone': True,   # 是否联合训练ResNet backbone
-        'grad_clip': 1.0,         # 梯度裁剪阈值
+        'grad_clip': 5.0,         # 梯度裁剪阈值（增大以允许更大的梯度更新）
         'loss_weights': {         # 可按需微调各损失项权重
             'ssim': 2.0,
             'l2': 1.0,

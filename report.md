@@ -201,3 +201,183 @@ $$\text{logits} = \phi(S) \in \mathbb{R}^{1\times H\times W}$$
 ## CLIP使用模块
 
 
+
+---
+
+### 1）CLIP 的角色定位
+
+把 CLIP 当作**“清晰/模糊先验评估器”**：
+
+* 用文本提示（prompts）分别刻画“清晰”（clear）和“模糊”（unclear）的语义原型；
+* 让 CLIP 对**局部块（patch）**进行图文匹配，得到每个块是“清晰”还是“模糊”的相对支持度；
+* 再把块级分数“铺回去”形成**像素级软焦点图**（two-channel），作为**先验概率**喂给主模型，与可微的 Gradient/Variance 头输出的 **logits** 在 logits 域融合，最后 softmax 成像素权重用于融合。
+
+> **CLIP 给出“哪儿更像清晰/模糊”的软分布**，主模型再结合可学习证据做“后验决策”。
+
+---
+
+### 2）CLIPFocusClassifier：如何把文本与图像“对齐”
+
+#### 2.1 文本侧：清晰/模糊提示 → 文本特征（一次性计算+缓存）
+
+```python
+self.clear_prompts = [
+  "a clear and sharp image", "a focused photograph", ...
+]
+self.unclear_prompts = [
+  "a blurry and unclear image", "an unfocused photograph", ...
+]
+self.clear_text_features = self._encode_text_prompts(self.clear_prompts)
+self.unclear_text_features = self._encode_text_prompts(self.unclear_prompts)
+```
+
+* 用 `clip.tokenize(prompts)` → `clip_model.encode_text()` 得到每条文本的向量，然后 **L2 归一化**：
+  
+  $$t_i \leftarrow \frac{t_i}{|t_i|_2}$$
+  
+* 做了**多提示最大化**（见后面“图像相似度”）来增强鲁棒性：对一组描述里挑相似度最大的那条。
+
+
+
+#### 2.2 图像侧：补丁（patch）化 + CLIP 统计的归一化
+
+考虑了**两套均值/方差**：
+
+* 训练/数据管线常见的 ImageNet 统计（`dataset_mean/std`）；
+* CLIP 官方需配的统计（`clip_mean/std`）。
+
+在 `_compute_focus_scores` 中先把输入 patch **反归一**回 [0,1]，然后再按 **CLIP mean/std** 标准化，确保输入分布**契合 CLIP 预期**：
+
+```python
+patches = patches * dataset_std + dataset_mean  # 回到[0,1]
+patches = (patches - clip_mean) / clip_std      # 转CLIP分布
+```
+
+随后把每个 patch 插值为 **224×224**（ViT-B/32 的默认输入尺寸）再喂入 `clip_model.encode_image`，并 **L2 归一化**：
+
+$$f \leftarrow \frac{f}{|f|_2}$$
+
+
+#### 2.3 图文相似度 → “清晰/模糊”两个簇的对比
+
+对每个 patch 的图像特征 (f)：
+
+* 与清晰提示簇 (${t^{(c)}*k}$) 做点积（就是 cosine，相当于 CLIP 相似度），取**最大值**：
+  
+  $$s*{\text{clear}}=\max_k ; f^\top t^{(c)}_k$$
+  
+* 与模糊提示簇 ({t^{(u)}*k}) 同理：
+  
+  $$s*{\text{unclear}}=\max_k ; f^\top t^{(u)}_k$$
+  
+* 计算**归一化的清晰得分**（你代码里的 `focus_score`）：
+  
+  $$\text{focus}=\frac{s_{\text{clear}}}{s_{\text{clear}}+s_{\text{unclear}}+\varepsilon}\in(0,1)$$
+  
+* 同时记录一个**置信度**（`confidence = max(s_clear, s_unclear)`），可度量该块“像两类原型之一”的强度。
+
+> 这是**二元对比归一**，不是 softmax，但含义等价于“清晰相对于模糊的支持度比例”。
+
+---
+
+### 3）get_pixel_focus_map：从块级到像素级的软图
+
+使用 `unfold/fold` 机制：
+
+* `unfold(kernel=patch_size, stride=stride)` 把整图 `[C,H,W]` 切成 L 个 patch（通常重叠）。
+* 对每个 patch 计算 `focus_score`（如上）。得到长度 L 的一维分数列。
+* 把每个分数**均匀铺**回对应 patch 的像素（复制 patch_size² 次），再用 `fold` 叠回到 `[H,W]`：
+
+  * 同一个像素可能被多个重叠 patch 覆盖，用**计数图** `count_map` 做了平均（除法），相当于一种**滑动窗口平滑**。
+* 输出的是 **单通道清晰度热力图**（值越大越清晰）。
+
+这一步是把**块级语义判断**变为**像素级软先验**，对噪声鲁棒（重叠平均），也能自然平滑边界。
+
+---
+
+### 4）CLIPPixelFusion：两幅图的先验 → 两通道概率
+
+对 `img1`、`img2` 分别生成各自的像素清晰度图 `focus_map1` / `focus_map2`，再做：
+
+```python
+focus_maps = torch.cat([focus_map1, focus_map2], dim=1)   # [B,2,H,W]
+focus_maps = torch.clamp(focus_maps, min=1e-6)
+focus_maps = focus_maps / (focus_maps.sum(dim=1, keepdim=True) + 1e-6)
+```
+
+* 得到**两通道先验概率**，逐像素相加为 1。
+* 这是“CLIP 判断图像1/图像2谁更清晰”的**软概率**，可视为 ($p_{\text{CLIP}}(y=i\mid x)$)。
+
+---
+
+### 5）与可微 logits 融合（主模型内的关键数学）
+
+在 `MultiFocusFusionModel.forward`：
+
+1. **可微证据**（来自 FeatureExtractor+GradientVarianceFocusHead）得到两个上采样后的 **logits**：
+   
+   $$\ell_1(x),; \ell_2(x)\quad \Rightarrow\quad L_{\text{base}}=[\ell_1,\ell_2]$$
+   
+2. CLIP 先验是概率分布 `[B,2,H,W]`，取对数 → **logits 偏置**：
+   
+   $$L_{\text{prior}}=\log p_{\text{CLIP}}$$
+   
+3. 线性门控融合（你用 `clip_weight=λ`）：
+   
+   $$L_{\text{comb}}=(1-\lambda),L_{\text{base}}+\lambda,L_{\text{prior}}$$
+   
+   直觉：(\lambda) 大时更信 CLIP，小时更信可微头。
+4. softmax 得到最终后验：
+   
+   $$p(y=i\mid x);=;\text{softmax}(L_{\text{comb}})_i$$
+   
+5. 用这两通道后验做像素级凸组合：
+   
+   $$\text{fused}=p_1\cdot \text{img1} + p_2\cdot \text{img2}$$
+   
+
+> 这一步是**贝叶斯风味**：把 CLIP 概率先验转 logits 后与“似然风味的可微证据”相加，最后软决策。
+
+---
+
+
+
+
+
+### 7）可改进点（实用增强）
+
+1. **自适应门控**：让 `λ` 随 `confidence` 调整：
+   
+   $$\lambda(i,j)=\text{clip}\big(a\cdot\text{conf}(i,j)+b,;[0,1]\big)$$
+   
+   置信度低的像素，更信可微头；置信度高的像素，更信 CLIP。
+
+2. **多尺度先验**：组合不同 `(patch_size, stride)` 的热力图（如 16/32/48），concat 后再用小头压成先验概率，细节更稳。
+
+3. **提示工程**：
+
+   * 扩充中文/多语种 prompt；
+   * 针对你的数据域做 prompt 微调（如“microscopy sharp focus”，“text on sign is readable”等）。
+
+4. **先验后处理**：
+
+   * 对先验概率做轻微 **温度缩放** (p^{1/\tau}) 或 **logits 放大/收缩** 调温度；
+   * 加 TV 正则/双边滤波平滑先验。
+
+5. **缓存与加速**：
+
+   * 数据集固定时，可把 `focus_map` **离线缓存**（特别是训练阶段），大幅提速。
+   * 训练时隔若干 step 更新一次先验（EMA），而不是每个 iteration 都跑 CLIP。
+
+---
+
+
+
+
+
+### 总体来说
+
+**先构建可泛化的语义先验（块级→像素级），再和可微统计证据在 logits 空间融合**。这既利用了 CLIP 的“开箱即用”语义判别能力，又保持了端到端可训练的灵活性。若接下来需要，我可以帮你把 **λ 的自适应门控**、**多尺度先验**、或 **prompt 优化** 直接写进你现有代码的可插拔版本。
+
+有一些使用clip的论文，但是都主要是红外、可见光融合以及多模态融合而不是多聚焦融合，并且我的使用方法更细化，对整幅图像做 patch 分块、逐块用 CLIP encode，然后拼成 像素级焦点图（soft focus map），而不是只用整体图像语义或图像-文本匹配，并且还有可以修改的点，我在前面也列出了。
+
