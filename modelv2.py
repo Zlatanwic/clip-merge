@@ -501,79 +501,130 @@ class CLIPPixelFusion(nn.Module):
         return focus_maps
 
 
+class SpatialGatingModule(nn.Module):
+    """
+    自适应空间门控模块
+    功能：根据输入的特征图，动态生成 CLIP 分支的权重图。
+    输入：feat1, feat2 (B, C, H, W)
+    输出：gate (B, 1, H, W), 值域 [0, 1]
+    """
+    def __init__(self, in_channels=64, reduction=16):
+        super().__init__()
+        # 将两张图的特征拼接，输入通道翻倍
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels // reduction, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(in_channels // reduction, in_channels // reduction, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            
+            # 输出 1 通道的权重图
+            nn.Conv2d(in_channels // reduction, 1, kernel_size=1),
+            nn.Sigmoid()  # 确保权重在 0-1 之间
+        )
+        
+        # 初始化：偏置设为 0，使其初始状态接近 0.5 (即 sigmoid(0))
+        # 或者可以设为稍微偏向 CLIP 或 局部特征
+        for m in self.gate_conv.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, feat1, feat2):
+        # 拼接特征：让网络通过对比两张图的特征来决定权重
+        cat_feat = torch.cat([feat1, feat2], dim=1) 
+        gate = self.gate_conv(cat_feat)
+        return gate
+
+
+
+
 # 修改原模型的MultiFocusFusionModel，替换CLIP部分
 class MultiFocusFusionModel(nn.Module):
-    """多聚焦图像融合模型（使用可微软聚焦融合）"""
+    """多聚焦图像融合模型（集成可学习门控）"""
     def __init__(
         self,
         block_size=32,
         overlap=4,
         clip_patch_size=32,
         clip_stride=16,
-        clip_weight=0.6,
+        # clip_weight=0.6,  <-- 删除这个固定参数
         train_backbone=False,
+        channels=64 # 对应 FeatureExtractor 的输出通道
     ):
         super().__init__()
         self.block_size = block_size
         self.overlap = overlap
-        self.clip_weight = clip_weight
-
-        # self.feature_extractor = FeatureExtractor(freeze=not train_backbone)
-        self.feature_extractor = AttentionEnhancedFeatureExtractor(freeze=not train_backbone)
+        
+        # 1. 特征提取器
+        self.feature_extractor = AttentionEnhancedFeatureExtractor(freeze=not train_backbone, channels=channels)
+        
+        # 2. 局部聚焦头 (Gradient/Variance)
         self.focus_head = GradientVarianceFocusHead()
-        self.qkcu = QKCU()
-
+        
+        # 3. CLIP 模块 (Frozen)
         self.clip_fusion = CLIPPixelFusion(
             device=device,
             patch_size=clip_patch_size,
             stride=clip_stride
         )
 
-        self.preprocess = transforms.Compose([
-            transforms.Resize((512, 512)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # 4. [新增] 可学习的空间门控模块
+        # 它将决定最终结果中有多少成分来自 CLIP
+        self.gating_module = SpatialGatingModule(in_channels=channels)
+        
+        # 可选：保留一个可学习的全局缩放因子，增加灵活性
+        self.temperature = nn.Parameter(torch.tensor(1.0)) 
 
     def forward(self, img1, img2):
-        """
-        输入: 两张多聚焦图像 (B, 3, H, W)
-        输出: 
-            fused_img: (B, 3, H, W)
-            focus_maps: (B, 2, H, W)
-        """
         B, C, H, W = img1.shape
 
-        # 1. 局部特征提取
-        # feat1 = self.feature_extractor(img1)  # (B,64,H/4,W/4)
-        # feat2 = self.feature_extractor(img2)
+        # 1. 提取深层特征 (B, 64, H/4, W/4)
         feat1, feat2 = self.feature_extractor(img1, img2)
-        # ❗ focus_head 现在返回 logits（单返回值）
-        logit1 = self.focus_head(feat1)       # (B,1,H/4,W/4)
-        logit2 = self.focus_head(feat2)       # (B,1,H/4,W/4)
+        
+        # 2. 计算局部特征的 Logits (B, 1, H/4, W/4)
+        logit1 = self.focus_head(feat1)
+        logit2 = self.focus_head(feat2)
 
-        # 2. CLIP 软焦点（不可微先验）
+        # 3. 计算 CLIP 软焦点图 (B, 2, H, W)
+        # CLIP 输出的是概率 (sum=1)，我们需要将其视为一种先验
         with torch.no_grad():
-            clip_focus_maps = self.clip_fusion(img1, img2).detach()  # (B,2,H,W)
+            clip_focus_maps = self.clip_fusion(img1, img2).detach()
+            # 加上极小值防止 log 出错
             clip_focus_maps = torch.clamp(clip_focus_maps, min=1e-6, max=1.0)
+            # 将 CLIP 概率转回 Logits 域，以便与 logit1/2 进行加权求和
+            clip_prior_logits = torch.log(clip_focus_maps) 
 
-        # 3. 可微基础 logits（注意：这里是 logits，不是概率，不要 clamp/log）
+        # 4. [关键修改] 计算可学习的门控权重
+        # gate 输出为 (B, 1, H/4, W/4)，值域 [0, 1]
+        gate_low_res = self.gating_module(feat1, feat2)
+        
+        # 将门控图上采样到原图尺寸 (B, 1, H, W)
+        gate_map = F.interpolate(gate_low_res, size=(H, W), mode='bilinear', align_corners=False)
+        
+        # 5. 准备局部特征的 Logits
         logit1_up = F.interpolate(logit1, size=(H, W), mode='bilinear', align_corners=False)
         logit2_up = F.interpolate(logit2, size=(H, W), mode='bilinear', align_corners=False)
-        base_logits = torch.cat([logit1_up, logit2_up], dim=1)  # (B,2,H,W)
+        base_logits = torch.cat([logit1_up, logit2_up], dim=1) # (B, 2, H, W)
 
-        # 4. CLIP 先验转成 logits 偏置 + softmax 融合
-        clip_prior_logits = torch.log(clip_focus_maps + 1e-8)  # 先验是概率，取 log 成为 logits 偏置
-        clip_gate = self.clip_weight                 # 降低CLIP权重，让可训练部分有更多学习空间
-        # 使用温度缩放，让logits更平滑
-        temperature = 1.0
-        combined_logits = ((1.0 - clip_gate) * base_logits + clip_gate * clip_prior_logits) / temperature
+        # 6. 加权融合 Logits
+        # 公式: Final = (1 - Gate) * Local + Gate * CLIP
+        # Gate 越大，越相信 CLIP；Gate 越小，越相信局部梯度/方差
+        
+        # 注意：这里 gate_map 会自动广播到 (B, 2, H, W)
+        combined_logits = ((1.0 - gate_map) * base_logits + gate_map * clip_prior_logits) / self.temperature
 
-        final_focus_maps = torch.softmax(combined_logits, dim=1)  # (B,2,H,W)
+        # 7. 生成最终 Focus Maps
+        final_focus_maps = torch.softmax(combined_logits, dim=1)  # (B, 2, H, W)
 
-        # 5. 融合
+        # 8. 图像融合
         fused_img = final_focus_maps[:, 0:1] * img1 + final_focus_maps[:, 1:2] * img2
-        return fused_img, final_focus_maps
+        
+        # 可以在训练时返回 gate_map 监控模型更倾向于信赖谁
+        return fused_img, final_focus_maps , gate_map
 
 
 

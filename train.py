@@ -2,22 +2,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter  
+from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import autocast, GradScaler
 import os
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt  # 🔥 新增：用于保存热力图
 
-# 导入数据集（使用修改后的仅训练集加载器）和模型
-from datasets import get_mfiwh_train_loader  # 仅导入训练集加载器
+# 导入数据集和模型
+from datasets import get_mfiwh_train_loader
 from modelv2 import MultiFocusFusionModel
 
 # 设备配置
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"使用设备: {device}")
-
 
 # -------------------------- 损失函数（保持原有） --------------------------
 def _torch_fspecial_gauss(size, sigma, device, dtype):
@@ -35,12 +35,10 @@ def SSIM_LOSS(img1, img2, size=11, sigma=1.5):
     K1, K2, L = 0.01, 0.03, 1.0
     C1, C2 = (K1 * L) ** 2, (K2 * L) ** 2
 
-    # 👇 手动做反射填充
     pad = size // 2
     img1_pad = F.pad(img1, (pad, pad, pad, pad), mode='reflect')
     img2_pad = F.pad(img2, (pad, pad, pad, pad), mode='reflect')
 
-    # 然后正常卷积
     mu1 = F.conv2d(img1_pad, window, stride=1, groups=img1.size(1))
     mu2 = F.conv2d(img2_pad, window, stride=1, groups=img2.size(1))
     mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
@@ -54,38 +52,29 @@ def SSIM_LOSS(img1, img2, size=11, sigma=1.5):
     )
     return 1 - ssim_map.mean()
 
-
-
 def L2_LOSS(diff):
-    """L2损失（更标准版）"""
     B, C, H, W = diff.shape
     l2 = torch.norm(diff, p=2, dim=(1, 2, 3)) / (C * H * W)
     return l2.mean()
 
 def Fro_LOSS(diff):
-    """Frobenius损失（矩阵L2范数平方）"""
     B, C, H, W = diff.shape
     fro = torch.sum(diff * diff, dim=(1, 2, 3)) / (C * H * W)
     return fro.mean()
 
-
-
-# -------------------------- 辅助损失函数（保持不变） --------------------------
+# -------------------------- 辅助损失函数 --------------------------
 def create_smoothness_loss(focus_maps):
-    """平滑性损失：约束聚焦图空间连续性"""
     grad_x = torch.abs(focus_maps[:, :, :, 1:] - focus_maps[:, :, :, :-1])
     grad_y = torch.abs(focus_maps[:, :, 1:, :] - focus_maps[:, :, :-1, :])
     return torch.mean(grad_x) + torch.mean(grad_y)
 
 def create_focus_accuracy_loss(focus_maps, source1, source2, gt):
-    """聚焦准确性损失：匹配理想聚焦图"""
     with autocast(enabled=False):
         focus_maps = focus_maps.to(torch.float32)
         source1 = source1.to(torch.float32)
         source2 = source2.to(torch.float32)
 
         def calculate_sharpness(img):
-            """计算图像清晰度（拉普拉斯算子）"""
             gray = torch.mean(img, dim=1, keepdim=True) if img.dim() == 4 else img.unsqueeze(0)
             laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=img.device, dtype=torch.float32).view(1, 1, 3, 3)
             return torch.abs(F.conv2d(gray, laplacian, padding=1))
@@ -101,9 +90,8 @@ def create_focus_accuracy_loss(focus_maps, source1, source2, gt):
     return loss
 
 
-# -------------------------- 辅助函数（图像日志、保存、归一化检查） --------------------------
+# -------------------------- 辅助函数（改动部分） --------------------------
 def check_normalization(tensor, name, step, writer):
-    """检查张量归一化情况并记录到TensorBoard"""
     with torch.no_grad():
         mean_val = tensor.mean().item()
         std_val = tensor.std().item()
@@ -118,8 +106,9 @@ def check_normalization(tensor, name, step, writer):
         if step % 10 == 0:
             print(f"[{name} 归一化检查] 均值: {mean_val:.4f}, 标准差: {std_val:.4f}, 范围: [{min_val:.4f}, {max_val:.4f}]")
 
-def save_images_to_folder(img1, img2, fused_img, gt_img, epoch, batch_idx, mean, std, save_dir):
-    """保存训练过程中的图像（含反归一化）"""
+# 🔥 修改：增加了 focus_maps 和 gate_map 的接收和保存逻辑
+def save_images_to_folder(img1, img2, fused_img, gt_img, focus_maps, gate_map, epoch, batch_idx, mean, std, save_dir):
+    """保存训练过程中的图像（含热力图）"""
     epoch_dir = os.path.join(save_dir, f'epoch_{epoch}')
     os.makedirs(epoch_dir, exist_ok=True)
     
@@ -129,31 +118,44 @@ def save_images_to_folder(img1, img2, fused_img, gt_img, epoch, batch_idx, mean,
         tensor = tensor * std.view(3, 1, 1) + mean.view(3, 1, 1)
         return torch.clamp(tensor, 0.0, 1.0)
     
-    for i in range(img1.size(0)):
-        img1_denorm = denormalize(img1[i])
-        img2_denorm = denormalize(img2[i])
-        fused_denorm = denormalize(fused_img[i])
-        gt_denorm = denormalize(gt_img[i])
-        
-        # 转换为PIL图像并保存
-        img1_pil = Image.fromarray((img1_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        img2_pil = Image.fromarray((img2_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        fused_pil = Image.fromarray((fused_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        gt_pil = Image.fromarray((gt_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        
-        base_name = f'batch_{batch_idx}_sample_{i}'
-        img1_pil.save(os.path.join(epoch_dir, f'{base_name}_img1.jpg'), 'JPEG', quality=95)
-        img2_pil.save(os.path.join(epoch_dir, f'{base_name}_img2.jpg'), 'JPEG', quality=95)
-        fused_pil.save(os.path.join(epoch_dir, f'{base_name}_fused.jpg'), 'JPEG', quality=95)
-        gt_pil.save(os.path.join(epoch_dir, f'{base_name}_gt.jpg'), 'JPEG', quality=95)
+    # 仅保存 Batch 中的第一张图
+    i = 0
+    img1_denorm = denormalize(img1[i])
+    img2_denorm = denormalize(img2[i])
+    fused_denorm = denormalize(fused_img[i])
+    gt_denorm = denormalize(gt_img[i])
+    
+    # 转换为PIL图像并保存
+    img1_pil = Image.fromarray((img1_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+    img2_pil = Image.fromarray((img2_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+    fused_pil = Image.fromarray((fused_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+    gt_pil = Image.fromarray((gt_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+    
+    base_name = f'batch_{batch_idx}_sample_{i}'
+    img1_pil.save(os.path.join(epoch_dir, f'{base_name}_img1.jpg'), 'JPEG', quality=95)
+    img2_pil.save(os.path.join(epoch_dir, f'{base_name}_img2.jpg'), 'JPEG', quality=95)
+    fused_pil.save(os.path.join(epoch_dir, f'{base_name}_fused.jpg'), 'JPEG', quality=95)
+    gt_pil.save(os.path.join(epoch_dir, f'{base_name}_gt.jpg'), 'JPEG', quality=95)
 
-def log_images_to_tensorboard(writer, img1, img2, fused_img, gt_img, epoch, batch_idx, mean, std):
+    # 🔥 保存 Focus Map (img1 的权重图)
+    # focus_maps: [B, 2, H, W] -> 取 [0, 0, :, :]
+    f_map = focus_maps[i, 0].detach().cpu().numpy()
+    plt.imsave(os.path.join(epoch_dir, f'{base_name}_FocusMap.png'), f_map, cmap='jet')
+
+    # 🔥 保存 Gate Map (CLIP 的权重图)
+    # gate_map: [B, 1, H, W] -> 取 [0, 0, :, :]
+    g_map = gate_map[i, 0].detach().cpu().numpy()
+    plt.imsave(os.path.join(epoch_dir, f'{base_name}_GateMap.png'), g_map, cmap='magma', vmin=0, vmax=1)
+
+
+def log_images_to_tensorboard(writer, img1, img2, fused_img, gt_img, gate_map, epoch, batch_idx, mean, std):
     """将图像记录到TensorBoard（实时查看训练效果）"""
     sample_idx = 0  # 取批次中第一个样本展示
     img1_sample = img1[sample_idx]
     img2_sample = img2[sample_idx]
     fused_sample = fused_img[sample_idx]
     gt_sample = gt_img[sample_idx]
+    gate_sample = gate_map[sample_idx] # 🔥
     
     def denormalize(tensor):
         tensor = tensor.detach()
@@ -171,9 +173,10 @@ def log_images_to_tensorboard(writer, img1, img2, fused_img, gt_img, epoch, batc
     writer.add_image(f'Input/Image2', img2_denorm, global_step=global_step, dataformats='CHW')
     writer.add_image(f'Output/Fused', fused_denorm, global_step=global_step, dataformats='CHW')
     writer.add_image(f'GroundTruth/GT', gt_denorm, global_step=global_step, dataformats='CHW')
+    writer.add_image(f'Internal/GateMap', gate_sample, global_step=global_step, dataformats='CHW') # 🔥
 
 
-# -------------------------- 训练主函数（移除所有验证逻辑） --------------------------
+# -------------------------- 训练主函数 --------------------------
 def train_integrated_model(P):
     detect_anomaly = P.get('detect_anomaly', False)
     if detect_anomaly:
@@ -185,7 +188,7 @@ def train_integrated_model(P):
     os.makedirs(image_save_dir, exist_ok=True)
     print(f"融合图像将保存至: {image_save_dir}")
     
-    # 1. 加载MFI-WHU全量数据（无验证集，全部用于训练）
+    # 1. 加载数据
     print("\n[1/5] 加载MFI-WHU全量训练集...")
     train_loader = get_mfiwh_train_loader(
         root_dir=P['data_dir'],
@@ -194,15 +197,13 @@ def train_integrated_model(P):
     )
     print(f"✅ 全量训练集加载完成：共{len(train_loader.dataset)}张样本，{len(train_loader)}个批次")
     
-    # 获取归一化参数（优先用数据集自带，无则用ImageNet默认）
+    # 获取归一化参数
     try:
         data_mean = torch.tensor(train_loader.dataset.mean, device=device)
         data_std = torch.tensor(train_loader.dataset.std, device=device)
-        print(f"使用数据集自带归一化参数: mean={data_mean.tolist()}, std={data_std.tolist()}")
     except:
         data_mean = torch.tensor([0.485, 0.456, 0.406], device=device)
         data_std = torch.tensor([0.229, 0.224, 0.225], device=device)
-        print(f"使用ImageNet默认归一化参数: mean={data_mean.tolist()}, std={data_std.tolist()}")
     
     # 2. 初始化多聚焦融合模型
     print("\n[2/5] 初始化多聚焦融合模型...")
@@ -211,82 +212,59 @@ def train_integrated_model(P):
         overlap=P['overlap'],
         clip_patch_size=P.get('clip_patch_size', 32),
         clip_stride=P.get('clip_stride', 16),
-        clip_weight=P.get('clip_weight', 0.6),
+        # 🔥 修正：移除了 clip_weight 参数，因为现在它是可学习的 gate
         train_backbone=P.get('train_backbone', False)
     ).to(P['device'])
-    print(f"✅ 模型初始化完成，参数总数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"✅ 模型初始化完成")
     
-    # 3. 配置优化器和学习率调度器
+    # 3. 配置优化器
     print("\n[3/5] 设置优化器与学习率调度...")
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optim.Adam(trainable_params, lr=P['lr'])
-    scheduler = StepLR(optimizer, step_size=20, gamma=0.5)  # 每20轮学习率减半
-    print(f"✅ 优化器: Adam (lr={P['lr']}), 调度器: StepLR (step_size=20, gamma=0.5)")
+    scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
+    
     amp_device_available = torch.cuda.is_available() and 'cuda' in str(P['device']).lower()
     requested_amp = P.get('use_amp', amp_device_available)
     use_amp = requested_amp and amp_device_available
-    if requested_amp and not amp_device_available:
-        print("⚠️ 检测到非 CUDA 设备，自动混合精度已自动关闭")
     scaler = GradScaler(enabled=use_amp)
-    print(f"⚙️ 自动混合精度: {'开启' if use_amp else '关闭'}")
     
-    # 4. 初始化TensorBoard日志
+    # 4. 初始化日志
     log_dir = os.path.join(P['save_dir'], 'tensorboard_logs')
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
-    print(f"✅ TensorBoard日志目录: {log_dir} (运行: tensorboard --logdir {log_dir})")
     
-    
-    # 5. 训练循环（仅训练，无验证）
+    # 5. 训练循环
     print("\n[4/5] 开始全量数据训练...")
-    best_train_loss = float('inf')  # 跟踪训练集最佳损失（无验证损失）
-    log_interval = 5  # 每5个批次记录一次TensorBoard图像
-    save_image_interval = 1  # 每1个epoch保存一次图像
+    best_train_loss = float('inf')
+    log_interval = 5
+    save_image_interval = 1
     
-    default_loss_weights = {
-        'ssim': 2.0,
-        'l2': 1.0,
-        'fro': 0.1,
-        'focus_acc': 1.5,
-        'smooth': 0.1
-    }
+    default_loss_weights = {'ssim': 2.0, 'l2': 1.0, 'fro': 0.1, 'focus_acc': 1.5, 'smooth': 0.1}
     loss_weights = {**default_loss_weights, **P.get('loss_weights', {})}
     grad_clip = P.get('grad_clip', 1.0)
 
     for epoch in range(P['num_epochs']):
-        model.train()  # 确保模型处于训练模式
-        train_metrics = {'total': 0, 'ssim': 0, 'l2': 0, 'fro': 0, 'focus_acc': 0, 'smooth': 0, 'grad_norm': 0}
+        model.train()
+        # 🔥 新增 gate_mean 指标监控
+        train_metrics = {'total': 0, 'ssim': 0, 'l2': 0, 'fro': 0, 'focus_acc': 0, 'smooth': 0, 'grad_norm': 0, 'gate_mean': 0}
         
-        # 遍历训练集批次
         for batch_idx, (img1, img2, gt_img) in enumerate(tqdm(
-            train_loader, desc=f'Epoch {epoch+1}/{P["num_epochs"]} (Train)'
+            train_loader, desc=f'Epoch {epoch+1}/{P["num_epochs"]}'
         )):
             img1, img2, gt_img = img1.to(P['device']), img2.to(P['device']), gt_img.to(P['device'])
-            
-            # 定期检查输入/输出归一化情况（避免数值异常）
-            if epoch % 10 == 0 and batch_idx == 0:
-                check_normalization(img1, 'img1', epoch, writer)
-                check_normalization(img2, 'img2', epoch, writer)
-                check_normalization(gt_img, 'gt_img', epoch, writer)
             
             optimizer.zero_grad(set_to_none=True)
             
             with autocast(enabled=use_amp):
-                # 前向传播：生成融合图像和聚焦图
-                fused_img, focus_maps = model(img1, img2)
+                # 🔥 修正：前向传播现在返回 3 个值
+                fused_img, focus_maps, gate_map = model(img1, img2)
                 
-                # 检查融合图像归一化情况
-                if epoch % 10 == 0 and batch_idx == 0:
-                    check_normalization(fused_img, 'fused_img', epoch, writer)
-                
-                # 计算各损失分量
                 loss_ssim = SSIM_LOSS(fused_img, gt_img)
                 loss_l2 = L2_LOSS(fused_img - gt_img)
                 loss_fro = Fro_LOSS(fused_img - gt_img)
                 loss_focus_acc = create_focus_accuracy_loss(focus_maps, img1, img2, gt_img)
                 loss_smooth = create_smoothness_loss(focus_maps)
                 
-                # 加权总损失（可配置权重）
                 total_loss = (
                     loss_weights['ssim'] * loss_ssim +
                     loss_weights['l2'] * loss_l2 +
@@ -295,7 +273,7 @@ def train_integrated_model(P):
                     loss_weights['smooth'] * loss_smooth
                 )
 
-            # 反向传播与参数更新
+            # 反向传播
             grad_norm_value = 0.0
             if use_amp:
                 scaler.scale(total_loss).backward()
@@ -311,7 +289,7 @@ def train_integrated_model(P):
             if isinstance(grad_norm_value, torch.Tensor):
                 grad_norm_value = grad_norm_value.item()
             
-            # 累计训练指标（用于计算epoch平均损失）
+            # 累计指标
             train_metrics['total'] += total_loss.item()
             train_metrics['ssim'] += loss_ssim.item()
             train_metrics['l2'] += loss_l2.item()
@@ -319,122 +297,74 @@ def train_integrated_model(P):
             train_metrics['focus_acc'] += loss_focus_acc.item()
             train_metrics['smooth'] += loss_smooth.item()
             train_metrics['grad_norm'] += grad_norm_value
+            # 🔥 记录 Gate 的平均值 (Detach 防止梯度泄露)
+            train_metrics['gate_mean'] += gate_map.detach().mean().item()
             
-            # 定期记录图像到TensorBoard
+            # 定期记录图像
             if batch_idx % log_interval == 0:
                 log_images_to_tensorboard(
-                    writer=writer,
-                    img1=img1,
-                    img2=img2,
-                    fused_img=fused_img,
-                    gt_img=gt_img,
-                    epoch=epoch,
-                    batch_idx=batch_idx,
-                    mean=data_mean,
-                    std=data_std
+                    writer=writer, img1=img1, img2=img2, fused_img=fused_img, gt_img=gt_img,
+                    gate_map=gate_map, # 🔥
+                    epoch=epoch, batch_idx=batch_idx, mean=data_mean, std=data_std
                 )
         
-        # 计算epoch平均训练损失
+        # 计算平均
         for k in train_metrics:
             train_metrics[k] /= len(train_loader)
         
-        # 学习率调度器更新
         scheduler.step()
         
-        # 打印当前epoch训练结果
         print(f"\nEpoch {epoch+1} 训练结果:")
-        print(f"训练总损失: {train_metrics['total']:.4f}")
-        print(f"  - SSIM损失: {train_metrics['ssim']:.4f}")
-        print(f"  - L2损失: {train_metrics['l2']:.4f}")
-        print(f"  - Frobenius损失: {train_metrics['fro']:.4f}")
-        print(f"  - 聚焦准确性损失: {train_metrics['focus_acc']:.4f}")
-        print(f"  - 平滑性损失: {train_metrics['smooth']:.4f}")
-        print(f"  - 梯度范数: {train_metrics['grad_norm']:.4f}")
-        print(f"当前学习率: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"Total Loss: {train_metrics['total']:.4f}")
+        print(f"Gate Mean (CLIP信任度): {train_metrics['gate_mean']:.4f}") # 越接近1越信赖CLIP，越接近0越信赖ResNet
         
-        # 记录训练指标到TensorBoard
         writer.add_scalar('Loss/Total_Train', train_metrics['total'], epoch)
-        writer.add_scalar('Loss/SSIM_Train', train_metrics['ssim'], epoch)
-        writer.add_scalar('Loss/L2_Train', train_metrics['l2'], epoch)
-        writer.add_scalar('Loss/Frobenius_Train', train_metrics['fro'], epoch)
-        writer.add_scalar('Loss/Focus_Acc_Train', train_metrics['focus_acc'], epoch)
-        writer.add_scalar('Loss/Smooth_Train', train_metrics['smooth'], epoch)
-        writer.add_scalar('LearningRate', scheduler.get_last_lr()[0], epoch)
-        writer.add_scalar('Grad/Norm', train_metrics['grad_norm'], epoch)
+        writer.add_scalar('Internal/Gate_Mean', train_metrics['gate_mean'], epoch) # 🔥
         
-        # 保存当前epoch的融合图像（便于可视化训练过程）
+        # 保存图像
         if epoch % save_image_interval == 0:
             save_images_to_folder(
-                img1=img1,  # 取最后一个批次的图像（也可改为固定批次）
-                img2=img2,
-                fused_img=fused_img,
-                gt_img=gt_img,
-                epoch=epoch,
-                batch_idx=batch_idx,
-                mean=data_mean,
-                std=data_std,
+                img1=img1, img2=img2, fused_img=fused_img, gt_img=gt_img,
+                focus_maps=focus_maps, gate_map=gate_map, # 🔥
+                epoch=epoch, batch_idx=batch_idx, mean=data_mean, std=data_std,
                 save_dir=image_save_dir
             )
         
-        # 保存训练集损失最优的模型
+        # 保存模型
         if train_metrics['total'] < best_train_loss:
             best_train_loss = train_metrics['total']
             torch.save(model.state_dict(), os.path.join(P['save_dir'], 'best_model.pth'))
-            print(f"✅ 保存最佳模型（训练损失: {best_train_loss:.4f}）")
+            print(f"✅ 保存最佳模型")
         
-        # 定期保存训练检查点（每10个epoch）
         if (epoch + 1) % 10 == 0:
             checkpoint_path = os.path.join(P['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_train_loss': best_train_loss,
-                'current_lr': scheduler.get_last_lr()[0]
-            }, checkpoint_path)
-            print(f"💾 保存第 {epoch+1} 轮检查点: {checkpoint_path}")
+            torch.save({'epoch': epoch + 1, 'model_state_dict': model.state_dict()}, checkpoint_path)
     
-    # 训练结束：关闭日志写入器
     writer.close()
-    print("\n" + "="*50)
     print("训练完成！")
-    print(f"📁 最佳模型: {os.path.join(P['save_dir'], 'best_model.pth')}")
-    print(f"📁 融合图像: {image_save_dir}")
-    print(f"📁 TensorBoard日志: {log_dir}")
-    print("="*50)
 
 
 if __name__ == '__main__':
-    # 训练参数配置（移除原验证相关参数）
     P = {
-        'batch_size': 8,          # 批次大小（根据GPU显存调整）
-        'num_epochs': 50,         # 训练轮数
-        'lr': 5e-4,               # 初始学习率
-        'device': device,         # 训练设备（cuda/cpu）
-        'use_amp': True,          # 是否启用自动混合精度
-        'detect_anomaly': False,  # 是否开启梯度异常检测
-        'save_dir': './checkpoints_mfiwh_full',  # 模型/日志保存目录
-        'data_dir': './data/MFI-WHU',            # MFI-WHU数据集根目录（含source_1/source_2/full_clear）
-        'num_workers': 2,         # 数据加载线程数（建议不超过CPU核心数）
-        'block_size': 32,         # 模型块大小（与modelv2.py保持一致）
-        'overlap': 4,             # 模型块重叠率（与modelv2.py保持一致）
-        'clip_patch_size': 32,    # CLIP 评估的切片大小
-        'clip_stride': 16,        # 切片滑动步幅
-        'clip_weight': 0.3,       # CLIP 焦点图占比（降低以让可训练部分有更多学习空间，建议0.2-0.4）
-        'train_backbone': True,   # 是否联合训练ResNet backbone
-        'grad_clip': 5.0,         # 梯度裁剪阈值（增大以允许更大的梯度更新）
-        'loss_weights': {         # 可按需微调各损失项权重
-            'ssim': 2.0,
-            'l2': 1.0,
-            'fro': 0.1,
-            'focus_acc': 1.5,
-            'smooth': 0.1
+        'batch_size': 8,
+        'num_epochs': 80,
+        'lr': 5e-4,
+        'device': device,
+        'use_amp': True,
+        'detect_anomaly': False,
+        'save_dir': './checkpoints_mfiwh_gated',
+        'data_dir': './data/MFI-WHU',
+        'num_workers': 2,
+        'block_size': 32,
+        'overlap': 4,
+        'clip_patch_size': 32,
+        'clip_stride': 16,
+        # 'clip_weight': 0.3,  <-- 🔥 这一行必须删除或注释掉
+        'train_backbone': True,
+        'grad_clip': 5.0,
+        'loss_weights': {
+            'ssim': 2.0, 'l2': 1.0, 'fro': 0.1, 'focus_acc': 1.5, 'smooth': 0.1
         }
     }
     
-    # 确保保存目录存在
-    os.makedirs(P['save_dir'], exist_ok=True)
-    
-    # 启动训练
     train_integrated_model(P)
-    

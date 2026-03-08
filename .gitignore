@@ -1,5 +1,14 @@
 data
 __pycache__
 checkpoints_mfiwh_full
+checkpoints_mfiwh_gated
 results
 output
+debug_results
+eval
+*.xlsx
+*.md
+*.pdf
+*.zip
+snap/
+results/
